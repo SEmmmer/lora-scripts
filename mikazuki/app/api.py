@@ -128,6 +128,15 @@ async def create_toml_file(request: Request):
     train_utils.fix_config_types(config)
 
     gpu_ids = config.pop("gpu_ids", None)
+    distributed_config = {
+        "num_processes": config.pop("num_processes", None),
+        "num_machines": config.pop("num_machines", 1),
+        "machine_rank": config.pop("machine_rank", 0),
+        "main_process_ip": config.pop("main_process_ip", ""),
+        "main_process_port": config.pop("main_process_port", 29500),
+        "nccl_socket_ifname": config.pop("nccl_socket_ifname", ""),
+        "gloo_socket_ifname": config.pop("gloo_socket_ifname", ""),
+    }
 
     suggest_cpu_threads = 8 if len(train_utils.get_total_images(config["train_data_dir"])) > 200 else 2
     model_train_type = config.pop("model_train_type", "sd-lora")
@@ -164,7 +173,13 @@ async def create_toml_file(request: Request):
     with open(toml_file, "w", encoding="utf-8") as f:
         f.write(toml.dumps(config))
 
-    result = process.run_train(toml_file, trainer_file, gpu_ids, suggest_cpu_threads)
+    result = process.run_train(
+        toml_file,
+        trainer_file,
+        gpu_ids,
+        suggest_cpu_threads,
+        distributed_config=distributed_config,
+    )
 
     return result
 
