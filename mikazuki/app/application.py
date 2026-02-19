@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException
 
@@ -16,10 +16,20 @@ from mikazuki.app.api import load_schemas, load_presets
 from mikazuki.app.api import router as api_router
 # from mikazuki.app.ipc import router as ipc_router
 from mikazuki.app.proxy import router as proxy_router
+from mikazuki.log import log
 from mikazuki.utils.devices import check_torch_gpu
 
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
+if os.path.exists("./frontend/dist/index.html"):
+    FRONTEND_STATIC_DIR = "frontend/dist"
+    FRONTEND_INDEX_FILE = "./frontend/dist/index.html"
+elif os.path.exists("./frontend/index.html"):
+    FRONTEND_STATIC_DIR = "frontend"
+    FRONTEND_INDEX_FILE = "./frontend/index.html"
+else:
+    FRONTEND_STATIC_DIR = None
+    FRONTEND_INDEX_FILE = None
 
 
 class SPAStaticFiles(StaticFiles):
@@ -81,11 +91,24 @@ app.include_router(api_router, prefix="/api")
 
 @app.get("/")
 async def index():
-    return FileResponse("./frontend/dist/index.html")
+    if FRONTEND_INDEX_FILE and os.path.exists(FRONTEND_INDEX_FILE):
+        return FileResponse(FRONTEND_INDEX_FILE)
+    return PlainTextResponse(
+        "Frontend assets are missing (frontend/dist or frontend/index.html). "
+        "Run `git clone https://github.com/hanamizuki-ai/lora-gui-dist frontend` "
+        "then restart GUI.",
+        status_code=503,
+    )
 
 
 @app.get("/favicon.ico", response_class=FileResponse)
 async def favicon():
     return FileResponse("assets/favicon.ico")
 
-app.mount("/", SPAStaticFiles(directory="frontend/dist", html=True), name="static")
+if FRONTEND_STATIC_DIR and os.path.isdir(FRONTEND_STATIC_DIR):
+    app.mount("/", SPAStaticFiles(directory=FRONTEND_STATIC_DIR, html=True), name="static")
+else:
+    log.warning(
+        "frontend static assets not found. GUI static files are unavailable "
+        "until frontend assets are restored."
+    )

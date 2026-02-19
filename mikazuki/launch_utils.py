@@ -11,7 +11,15 @@ from typing import List
 from pathlib import Path
 from typing import Optional
 
-import pkg_resources
+try:
+    import pkg_resources
+except ModuleNotFoundError:
+    pkg_resources = None
+
+try:
+    from importlib import metadata as importlib_metadata
+except ImportError:  # pragma: no cover
+    import importlib_metadata
 
 from mikazuki.log import log
 
@@ -50,17 +58,67 @@ def prepare_git():
 
 
 def prepare_submodules():
-    frontend_path = base_dir_path() / "frontend" / "dist"
-    tag_editor_path = base_dir_path() / "mikazuki" / "dataset-tag-editor" / "scripts"
+    frontend_dist_path = base_dir_path() / "frontend" / "dist"
+    frontend_index_path = base_dir_path() / "frontend" / "index.html"
+    tag_editor_script_path = base_dir_path() / "mikazuki" / "dataset-tag-editor" / "scripts" / "launch.py"
+    tag_editor_alt_script_path = base_dir_path() / "mikazuki" / "dataset-tag-editor" / "launch.py"
 
-    if not os.path.exists(frontend_path) or not os.path.exists(tag_editor_path):
-        log.info("submodule not found, try clone...")
-        log.info("checking git installation...")
-        if not prepare_git():
-            log.error("git not found, please install git first")
-            sys.exit(1)
-        subprocess.run(["git", "submodule", "init"])
-        subprocess.run(["git", "submodule", "update"])
+    def repo_missing(path: Path):
+        return not path.exists() or not any(path.iterdir())
+
+    frontend_ready = os.path.exists(frontend_dist_path) or os.path.exists(frontend_index_path)
+    tag_editor_ready = os.path.exists(tag_editor_script_path) or os.path.exists(tag_editor_alt_script_path)
+
+    if frontend_ready and tag_editor_ready:
+        return
+
+    log.info("submodule assets not found, try to recover...")
+    log.info("checking git installation...")
+    if not prepare_git():
+        log.error("git not found, please install git first")
+        return
+
+    subprocess.run(["git", "submodule", "sync", "--recursive"], check=False)
+    subprocess.run(["git", "submodule", "update", "--init", "--recursive"], check=False)
+
+    frontend_ready = os.path.exists(frontend_dist_path) or os.path.exists(frontend_index_path)
+    tag_editor_ready = os.path.exists(tag_editor_script_path) or os.path.exists(tag_editor_alt_script_path)
+    if frontend_ready and tag_editor_ready:
+        return
+
+    # Fallback for repos where submodule gitlinks are missing.
+    fallback_repos = [
+        {
+            "path": base_dir_path() / "frontend",
+            "url": "https://github.com/hanamizuki-ai/lora-gui-dist",
+        },
+        {
+            "path": base_dir_path() / "mikazuki" / "dataset-tag-editor",
+            "url": "https://github.com/Akegarasu/dataset-tag-editor",
+        },
+    ]
+
+    for repo in fallback_repos:
+        repo_path = repo["path"]
+        if not repo_missing(repo_path):
+            continue
+
+        if repo_path.exists():
+            try:
+                repo_path.rmdir()
+            except OSError:
+                log.warning(f"skip fallback clone because path is not empty: {repo_path}")
+                continue
+        repo_path.parent.mkdir(parents=True, exist_ok=True)
+        log.info(f"cloning fallback repo: {repo['url']} -> {repo_path}")
+        subprocess.run(["git", "clone", "--depth", "1", repo["url"], str(repo_path)], check=False)
+
+    frontend_ready = os.path.exists(frontend_dist_path) or os.path.exists(frontend_index_path)
+    tag_editor_ready = os.path.exists(tag_editor_script_path) or os.path.exists(tag_editor_alt_script_path)
+    if not frontend_ready:
+        log.warning("frontend assets are still missing after recovery. GUI static files will be unavailable.")
+    if not tag_editor_ready:
+        log.warning("dataset-tag-editor launcher is still missing after recovery. Tageditor will be unavailable.")
 
 
 def git_tag(path: str) -> str:
@@ -113,6 +171,27 @@ stderr: {result.stderr.decode(encoding="utf8", errors="ignore") if len(result.st
     return result.stdout.decode(encoding="utf8", errors="ignore")
 
 
+def get_installed_version(pkg_name: str) -> Optional[str]:
+    candidate_names = [pkg_name, pkg_name.lower(), pkg_name.replace("_", "-")]
+
+    if pkg_resources is not None:
+        for candidate in candidate_names:
+            try:
+                return pkg_resources.get_distribution(candidate).version
+            except Exception:
+                continue
+
+    for candidate in candidate_names:
+        try:
+            return importlib_metadata.version(candidate)
+        except importlib_metadata.PackageNotFoundError:
+            continue
+        except Exception:
+            continue
+
+    return None
+
+
 def is_installed(package, friendly: str = None):
     #
     # This function was adapted from code written by vladimandic: https://github.com/vladmandic/automatic/commits/master
@@ -143,14 +222,8 @@ def is_installed(package, friendly: str = None):
             else:
                 pkg_name, pkg_version = pkg.strip(), None
 
-            spec = pkg_resources.working_set.by_key.get(pkg_name, None)
-            if spec is None:
-                spec = pkg_resources.working_set.by_key.get(pkg_name.lower(), None)
-            if spec is None:
-                spec = pkg_resources.working_set.by_key.get(pkg_name.replace('_', '-'), None)
-
-            if spec is not None:
-                version = pkg_resources.get_distribution(pkg_name).version
+            version = get_installed_version(pkg_name)
+            if version is not None:
                 # log.debug(f'Package version found: {pkg_name} {version}')
 
                 if pkg_version is not None:

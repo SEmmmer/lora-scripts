@@ -26,6 +26,12 @@ parser.add_argument("--dev", action="store_true")
 
 @catch_exception
 def run_tensorboard():
+    try:
+        import pkg_resources  # noqa: F401
+    except ModuleNotFoundError:
+        log.warning("pkg_resources not found, skip tensorboard. Install setuptools in venv to enable tensorboard.")
+        return
+
     log.info("Starting tensorboard...")
     subprocess.Popen([sys.executable, "-m", "tensorboard.main", "--logdir", "logs",
                      "--host", args.tensorboard_host, "--port", str(args.tensorboard_port)])
@@ -34,9 +40,22 @@ def run_tensorboard():
 @catch_exception
 def run_tag_editor():
     log.info("Starting tageditor...")
+    script_candidates = [
+        base_dir_path() / "mikazuki/dataset-tag-editor/scripts/launch.py",
+        base_dir_path() / "mikazuki/dataset-tag-editor/launch.py",
+    ]
+    script_path = next((p for p in script_candidates if p.exists()), None)
+    if script_path is None:
+        log.warning(
+            "Tageditor script not found. Checked: "
+            + ", ".join(str(p) for p in script_candidates)
+            + ". Skip starting tageditor."
+        )
+        return
+
     cmd = [
         sys.executable,
-        base_dir_path() / "mikazuki/dataset-tag-editor/scripts/launch.py",
+        script_path,
         "--port", "28001",
         "--shadow-gradio-output",
         "--root-path", "/proxy/tageditor"
@@ -44,7 +63,7 @@ def run_tag_editor():
     if args.localization:
         cmd.extend(["--localization", args.localization])
     else:
-        l = locale.getdefaultlocale()[0]
+        l = locale.getlocale()[0]
         if l and l.startswith("zh"):
             cmd.extend(["--localization", "zh-Hans"])
     subprocess.Popen(cmd)
