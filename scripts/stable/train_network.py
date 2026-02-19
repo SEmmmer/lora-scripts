@@ -237,6 +237,9 @@ class NetworkTrainer:
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
 
         # モデルに xformers とか memory efficient attention を組み込む
+        args.mem_eff_attn, args.xformers, args.sdpa = train_util.resolve_attention_backend(
+            args.mem_eff_attn, args.xformers, args.sdpa
+        )
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
@@ -268,8 +271,13 @@ class NetworkTrainer:
             vae.to(accelerator.device, dtype=vae_dtype)
             vae.requires_grad_(False)
             vae.eval()
+            cache_writer = accelerator.is_local_main_process if args.cache_latents_to_disk else accelerator.is_main_process
+            logger.info(
+                f"cache_latents writer role: is_local_main_process={accelerator.is_local_main_process}, "
+                f"is_main_process={accelerator.is_main_process}, use_writer={cache_writer}"
+            )
             with torch.no_grad():
-                train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, accelerator.is_main_process)
+                train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, cache_writer)
             vae.to("cpu")
             clean_memory_on_device(accelerator.device)
 
@@ -802,7 +810,7 @@ class NetworkTrainer:
             ), f"max_train_steps should be greater than initial step / max_train_stepsは初期ステップより大きい必要があります: {args.max_train_steps} vs {initial_step}"
 
         progress_bar = tqdm(
-            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+            range(args.max_train_steps - initial_step), smoothing=0.5, disable=not accelerator.is_local_main_process, desc="steps"
         )
 
         epoch_to_start = 0

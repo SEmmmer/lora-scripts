@@ -4,10 +4,11 @@ import os
 import sys
 import webbrowser
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException
 
@@ -31,13 +32,223 @@ else:
     FRONTEND_STATIC_DIR = None
     FRONTEND_INDEX_FILE = None
 
+_WORKER_MODE_GUARD_INJECTION = """
+<style id="mikazuki-worker-rank-guard-style">
+[data-mikazuki-worker-hidden="1"] { display: none !important; }
+</style>
+<script id="mikazuki-worker-rank-guard">
+(function () {
+  if (window.__MIKAZUKI_WORKER_RANK_GUARD__) return;
+  window.__MIKAZUKI_WORKER_RANK_GUARD__ = true;
+
+  var state = {
+    confirmed: false,
+    lastRank: 0,
+    boundInput: null,
+    busy: false
+  };
+
+  var DIST_HEADING_RE = /(分布式训练|distributed training)/i;
+  var DIST_ITEM_RE = /(enable_distributed_training|machine_rank|num_machines|num_processes|main_process_ip|main_process_port|nccl_socket_ifname|gloo_socket_ifname|sync_from_main_settings|sync_config_from_main|sync_main_toml|sync_ssh_user|sync_ssh_port|sync_ssh_password)/i;
+
+  function toInt(value) {
+    var n = parseInt(value, 10);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function findMachineRankField() {
+    var items = document.querySelectorAll(".k-form .k-schema-item");
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var title = item.querySelector("h3");
+      if (!title) continue;
+      var text = (title.textContent || "").trim();
+      if (!/machine_rank/i.test(text)) continue;
+      var input = item.querySelector("input");
+      if (!input) continue;
+      return { item: item, input: input };
+    }
+    return null;
+  }
+
+  function clearWorkerHidden(form) {
+    var hidden = form.querySelectorAll("[data-mikazuki-worker-hidden='1']");
+    for (var i = 0; i < hidden.length; i++) {
+      hidden[i].removeAttribute("data-mikazuki-worker-hidden");
+    }
+  }
+
+  function collapseNonDistributedModules(form) {
+    var children = Array.prototype.slice.call(form.children || []);
+    var hasHeading = false;
+    var keepCurrent = false;
+    var foundDistributedHeading = false;
+
+    for (var i = 0; i < children.length; i++) {
+      var el = children[i];
+      if (el.tagName === "H2") {
+        hasHeading = true;
+        var headingText = (el.textContent || "").trim();
+        keepCurrent = DIST_HEADING_RE.test(headingText);
+        if (keepCurrent) foundDistributedHeading = true;
+        continue;
+      }
+      if (hasHeading && !keepCurrent) {
+        el.setAttribute("data-mikazuki-worker-hidden", "1");
+      }
+    }
+
+    if (!hasHeading || !foundDistributedHeading) {
+      var items = form.querySelectorAll(".k-schema-item");
+      for (var j = 0; j < items.length; j++) {
+        var item = items[j];
+        var title = item.querySelector("h3");
+        var text = (title && title.textContent ? title.textContent : "").trim();
+        if (!DIST_ITEM_RE.test(text)) {
+          item.setAttribute("data-mikazuki-worker-hidden", "1");
+        }
+      }
+    }
+  }
+
+  function applyWorkerMode(enabled) {
+    var form = document.querySelector(".k-form");
+    if (!form) return;
+    clearWorkerHidden(form);
+    if (enabled) {
+      collapseNonDistributedModules(form);
+    }
+  }
+
+  function setRankInputValue(input, rank) {
+    input.value = String(rank);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function onRankMaybeChanged(force) {
+    var field = findMachineRankField();
+    if (!field) return;
+    if (state.busy) return;
+
+    var rank = toInt(field.input.value);
+    if (!force && rank === state.lastRank) return;
+    state.lastRank = rank;
+
+    if (rank !== 0 && !state.confirmed) {
+      var ok = window.confirm("检测到 machine_rank 不为 0，将把当前机器设置为从机。确认后会折叠除分布式配置外的其他模块。是否继续？");
+      if (!ok) {
+        state.busy = true;
+        setRankInputValue(field.input, 0);
+        state.lastRank = 0;
+        state.confirmed = false;
+        applyWorkerMode(false);
+        state.busy = false;
+        return;
+      }
+      state.confirmed = true;
+      applyWorkerMode(true);
+      return;
+    }
+
+    if (rank === 0) {
+      state.confirmed = false;
+      applyWorkerMode(false);
+      return;
+    }
+
+    if (state.confirmed) {
+      applyWorkerMode(true);
+    }
+  }
+
+  function bindRankListeners() {
+    var field = findMachineRankField();
+    if (!field) return false;
+    if (state.boundInput === field.input) return true;
+
+    state.boundInput = field.input;
+    state.lastRank = toInt(field.input.value);
+    field.input.addEventListener("input", function () { onRankMaybeChanged(false); });
+    field.input.addEventListener("change", function () { onRankMaybeChanged(false); });
+
+    var buttons = field.item.querySelectorAll(".el-input-number__increase, .el-input-number__decrease");
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].addEventListener("click", function () {
+        setTimeout(function () { onRankMaybeChanged(false); }, 0);
+      });
+    }
+    return true;
+  }
+
+  function tick() {
+    bindRankListeners();
+    if (state.confirmed) applyWorkerMode(true);
+  }
+
+  var observer = new MutationObserver(function () {
+    bindRankListeners();
+    if (state.confirmed) applyWorkerMode(true);
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+
+  window.addEventListener("load", function () { bindRankListeners(); });
+  setInterval(tick, 400);
+})();
+</script>
+"""
+_patched_index_cache: tuple[int, str] | None = None
+
+
+def _inject_worker_mode_guard(html_content: str) -> str:
+    if 'id="mikazuki-worker-rank-guard"' in html_content:
+        return html_content
+    if "</body>" in html_content:
+        return html_content.replace("</body>", _WORKER_MODE_GUARD_INJECTION + "\n</body>", 1)
+    return html_content + _WORKER_MODE_GUARD_INJECTION
+
+
+def _get_patched_frontend_index_content() -> str | None:
+    if FRONTEND_INDEX_FILE is None:
+        return None
+
+    index_path = Path(FRONTEND_INDEX_FILE)
+    if not index_path.exists() or not index_path.is_file():
+        return None
+
+    try:
+        mtime_ns = index_path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+    global _patched_index_cache
+    if _patched_index_cache and _patched_index_cache[0] == mtime_ns:
+        return _patched_index_cache[1]
+
+    try:
+        content = index_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    content = _inject_worker_mode_guard(content)
+    _patched_index_cache = (mtime_ns, content)
+    return content
+
 
 class SPAStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
+        if path == "index.html":
+            patched = _get_patched_frontend_index_content()
+            if patched is not None:
+                return HTMLResponse(content=patched)
+
         try:
             return await super().get_response(path, scope)
         except HTTPException as ex:
             if ex.status_code == 404:
+                patched = _get_patched_frontend_index_content()
+                if patched is not None:
+                    return HTMLResponse(content=patched)
                 return await super().get_response("index.html", scope)
             else:
                 raise ex
@@ -91,8 +302,9 @@ app.include_router(api_router, prefix="/api")
 
 @app.get("/")
 async def index():
-    if FRONTEND_INDEX_FILE and os.path.exists(FRONTEND_INDEX_FILE):
-        return FileResponse(FRONTEND_INDEX_FILE)
+    patched = _get_patched_frontend_index_content()
+    if patched is not None:
+        return HTMLResponse(content=patched)
     return PlainTextResponse(
         "Frontend assets are missing (frontend/dist or frontend/index.html). "
         "Run `git clone https://github.com/hanamizuki-ai/lora-gui-dist frontend` "

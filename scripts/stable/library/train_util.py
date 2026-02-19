@@ -652,6 +652,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         # caching
         self.caching_mode = None  # None, 'latents', 'text'
+        self._warned_missing_flipped_latents_npz = set()
 
     def adjust_min_max_bucket_reso_by_steps(
         self, resolution: Tuple[int, int], min_bucket_reso: int, max_bucket_reso: int, bucket_reso_steps: int
@@ -1270,9 +1271,22 @@ class BaseDataset(torch.utils.data.Dataset):
             elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
                 latents, original_size, crop_ltrb, flipped_latents, alpha_mask = load_latents_from_disk(image_info.latents_npz)
                 if flipped:
-                    latents = flipped_latents
+                    if flipped_latents is not None:
+                        latents = flipped_latents
+                    else:
+                        flipped_npz_path = getattr(image_info, "latents_npz_flipped", None)
+                        if flipped_npz_path is not None and os.path.exists(flipped_npz_path):
+                            latents, original_size, crop_ltrb, _, alpha_mask = load_latents_from_disk(flipped_npz_path)
+                        else:
+                            if image_info.latents_npz not in self._warned_missing_flipped_latents_npz:
+                                logger.warning(
+                                    f"missing flipped latents for {image_info.latents_npz}, fallback to non-flipped latents"
+                                )
+                                self._warned_missing_flipped_latents_npz.add(image_info.latents_npz)
                     alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
                     del flipped_latents
+                if latents is None:
+                    raise ValueError(f"invalid cached latents data (None): {image_info.latents_npz}")
                 latents = torch.FloatTensor(latents)
                 if alpha_mask is not None:
                     alpha_mask = torch.FloatTensor(alpha_mask)
@@ -2824,6 +2838,53 @@ def get_git_revision_hash() -> str:
 
 
 #     diffusers.models.attention.CrossAttention.forward = forward_xformers
+def resolve_attention_backend(mem_eff_attn, xformers, sdpa):
+    if not xformers:
+        return mem_eff_attn, xformers, sdpa
+
+    force_xformers = os.environ.get("MIKAZUKI_FORCE_XFORMERS", "").strip().lower() in {"1", "true", "yes", "on"}
+    if force_xformers:
+        logger.warning("MIKAZUKI_FORCE_XFORMERS is enabled, skip xformers compatibility check")
+        return mem_eff_attn, xformers, sdpa
+
+    if not torch.cuda.is_available():
+        fallback_sdpa = sdpa or not mem_eff_attn
+        logger.warning("xformers requested but CUDA is not available, fallback to SDPA")
+        return mem_eff_attn, False, fallback_sdpa
+
+    reason = None
+    try:
+        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    except Exception:
+        major, minor = torch.cuda.get_device_capability()
+
+    if major >= 12:
+        # Current public xformers wheels are often behind newest GPU architectures.
+        reason = f"unsupported GPU compute capability {major}.{minor}"
+
+    if reason is None:
+        try:
+            import xformers.ops as xops
+
+            q = torch.randn((1, 8, 1, 64), device="cuda", dtype=torch.float16)
+            with torch.no_grad():
+                _ = xops.memory_efficient_attention(q, q, q, attn_bias=None)
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+        finally:
+            if "q" in locals():
+                del q
+            if "_" in locals():
+                del _
+
+    if reason is not None:
+        fallback_sdpa = sdpa or not mem_eff_attn
+        logger.warning(f"xformers is disabled automatically ({reason}); fallback to SDPA={fallback_sdpa}")
+        return mem_eff_attn, False, fallback_sdpa
+
+    return mem_eff_attn, xformers, sdpa
+
+
 def replace_unet_modules(unet: UNet2DConditionModel, mem_eff_attn, xformers, sdpa):
     if mem_eff_attn:
         logger.info("Enable memory efficient attention for U-Net")
@@ -4619,6 +4680,23 @@ def prepare_accelerator(args: argparse.Namespace):
     dynamo_backend = "NO"
     if args.torch_compile:
         dynamo_backend = args.dynamo_backend
+
+    if torch.cuda.is_available():
+        local_rank_str = os.environ.get("LOCAL_RANK")
+        if local_rank_str is not None:
+            try:
+                local_rank = int(local_rank_str)
+                if 0 <= local_rank < torch.cuda.device_count():
+                    torch.cuda.set_device(local_rank)
+                    logger.info(f"set CUDA device from LOCAL_RANK: {local_rank}")
+                else:
+                    logger.warning(
+                        f"LOCAL_RANK={local_rank} is out of visible CUDA range [0, {torch.cuda.device_count() - 1}]"
+                    )
+            except ValueError:
+                logger.warning(f"invalid LOCAL_RANK value: {local_rank_str}")
+        elif torch.cuda.device_count() == 1:
+            torch.cuda.set_device(0)
 
     kwargs_handlers = (
         InitProcessGroupKwargs(timeout=datetime.timedelta(minutes=args.ddp_timeout)) if args.ddp_timeout else None,

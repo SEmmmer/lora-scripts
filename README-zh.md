@@ -168,6 +168,60 @@ source venv/bin/activate
 
 编辑 `train.sh`，然后运行它。
 
+#### Linux 双机分布式 LoRA 训练
+
+适用于你当前的两台机器：
+- 主节点：`192.168.50.219`
+- Worker：`192.168.50.229`
+- 网卡：`enp11s0`
+
+仓库新增了 `train_2node.sh`，用于两台 Linux 机器一键启动分布式训练（`train.sh` / `train_by_toml.sh`）。
+
+同步修改到 worker（推荐流程）：
+
+```sh
+# 主节点 192.168.50.219
+git add train.sh train_by_toml.sh train_2node.sh README-zh.md
+git commit -m "add 2-node distributed launcher for linux"
+git push
+```
+
+```sh
+# worker 192.168.50.229
+ssh emmmer@192.168.50.229
+# 首次
+git clone <你的仓库地址>
+# 或已有仓库
+cd lora-scripts-multi && git pull
+```
+
+两台机器都先激活环境：
+
+```sh
+source venv/bin/activate
+```
+
+在主节点启动（rank 0）：
+
+```sh
+NUM_PROCESSES_PER_MACHINE=1 bash train_2node.sh main train
+```
+
+在 worker 启动（rank 1）：
+
+```sh
+NUM_PROCESSES_PER_MACHINE=1 bash train_2node.sh worker train
+```
+
+如果你使用 TOML 配置训练，把 `train` 改成 `toml`：
+
+```sh
+NUM_PROCESSES_PER_MACHINE=1 bash train_2node.sh main toml
+NUM_PROCESSES_PER_MACHINE=1 bash train_2node.sh worker toml
+```
+
+注意：训练数据路径、底模路径、配置文件路径需要在两台机器保持一致（目录结构相同）。
+
 #### TensorBoard
 
 运行 `tensorboard.ps1` 将在 http://localhost:6006/ 启动 TensorBoard
@@ -176,13 +230,13 @@ source venv/bin/activate
 
 | 参数名称                     | 类型  | 默认值       | 描述                                            |
 |------------------------------|-------|--------------|-------------------------------------------------|
-| `--host`                     | str   | "127.0.0.1"  | 服务器的主机名                                  |
+| `--host`                     | str   | "0.0.0.0"    | 服务器的主机名                                  |
 | `--port`                     | int   | 28000        | 运行服务器的端口                                |
 | `--listen`                   | bool  | false        | 启用服务器的监听模式                            |
 | `--skip-prepare-environment` | bool  | false        | 跳过环境准备步骤                                |
 | `--disable-tensorboard`      | bool  | false        | 禁用 TensorBoard                                |
 | `--disable-tageditor`        | bool  | false        | 禁用标签编辑器                                  |
-| `--tensorboard-host`         | str   | "127.0.0.1"  | 运行 TensorBoard 的主机                         |
+| `--tensorboard-host`         | str   | "0.0.0.0"    | 运行 TensorBoard 的主机                         |
 | `--tensorboard-port`         | int   | 6006         | 运行 TensorBoard 的端口                          |
 | `--localization`             | str   |              | 界面的本地化设置                                |
 | `--dev`                      | bool  | false        | 开发者模式，用于禁用某些检查                     |

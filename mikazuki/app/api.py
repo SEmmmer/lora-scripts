@@ -53,11 +53,58 @@ trainer_mapping = {
 }
 
 
+def _to_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _to_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _read_iface_speed_mbps(iface_name: str) -> Optional[int]:
+    speed_file = Path("/sys/class/net") / iface_name / "speed"
+    try:
+        raw = speed_file.read_text(encoding="utf-8").strip()
+        value = int(raw)
+        if value > 0:
+            return value
+    except Exception:
+        return None
+    return None
+
+
+def _get_network_interface_options():
+    options = [{"value": "", "label": "自动选择"}]
+    net_root = Path("/sys/class/net")
+    if not net_root.exists():
+        return options
+
+    for iface in sorted([p.name for p in net_root.iterdir() if p.is_dir()]):
+        speed = _read_iface_speed_mbps(iface)
+        if speed is None:
+            label = f"{iface} (速率未知)"
+        else:
+            label = f"{iface} ({speed} Mbps)"
+        options.append({"value": iface, "label": label})
+
+    return options
+
+
 async def load_schemas():
     avaliable_schemas.clear()
 
     schema_dir = os.path.join(os.getcwd(), "mikazuki", "schema")
     schemas = os.listdir(schema_dir)
+    network_interface_options = _get_network_interface_options()
 
     def lambda_hash(x):
         return hashlib.md5(x.encode()).hexdigest()
@@ -65,6 +112,11 @@ async def load_schemas():
     for schema_name in schemas:
         with open(os.path.join(schema_dir, schema_name), encoding="utf-8") as f:
             content = f.read()
+            runtime_prelude = (
+                "window.__MIKAZUKI__ = window.__MIKAZUKI__ || {};\n"
+                f"window.__MIKAZUKI__.NETWORK_INTERFACE_OPTIONS = {json.dumps(network_interface_options, ensure_ascii=False)};\n"
+            )
+            content = runtime_prelude + content
             avaliable_schemas.append({
                 "name": schema_name.rstrip(".ts"),
                 "schema": content,
@@ -128,27 +180,59 @@ async def create_toml_file(request: Request):
     train_utils.fix_config_types(config)
 
     gpu_ids = config.pop("gpu_ids", None)
+    enable_distributed_training = config.pop("enable_distributed_training", None)
+    num_machines = config.pop("num_machines", 1)
+    machine_rank = config.pop("machine_rank", 0)
+    sync_from_main_settings = config.pop("sync_from_main_settings", {})
+    if not isinstance(sync_from_main_settings, dict):
+        sync_from_main_settings = {}
+
+    def pop_sync_value(key, default):
+        if key in config:
+            return config.pop(key)
+        return sync_from_main_settings.get(key, default)
+
+    if enable_distributed_training is None:
+        distributed_enabled = _to_int(num_machines, 1) > 1
+    else:
+        distributed_enabled = _to_bool(enable_distributed_training, False)
     distributed_config = {
+        "enable_distributed_training": distributed_enabled,
         "num_processes": config.pop("num_processes", None),
-        "num_machines": config.pop("num_machines", 1),
-        "machine_rank": config.pop("machine_rank", 0),
+        "num_machines": num_machines,
+        "machine_rank": machine_rank,
         "main_process_ip": config.pop("main_process_ip", ""),
         "main_process_port": config.pop("main_process_port", 29500),
         "nccl_socket_ifname": config.pop("nccl_socket_ifname", ""),
         "gloo_socket_ifname": config.pop("gloo_socket_ifname", ""),
+        "sync_use_password_auth": pop_sync_value("sync_use_password_auth", True),
+        "sync_ssh_password": pop_sync_value("sync_ssh_password", ""),
+        "sync_config_from_main": pop_sync_value("sync_config_from_main", True),
+        "sync_config_keys_from_main": pop_sync_value("sync_config_keys_from_main", "train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision"),
+        "sync_missing_assets_from_main": pop_sync_value("sync_missing_assets_from_main", True),
+        "sync_asset_keys": pop_sync_value("sync_asset_keys", "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"),
+        "sync_main_repo_dir": pop_sync_value("sync_main_repo_dir", os.getcwd()),
+        "sync_main_toml": pop_sync_value("sync_main_toml", "./config/autosave/distributed-main-latest.toml"),
+        "sync_ssh_user": pop_sync_value("sync_ssh_user", ""),
+        "sync_ssh_port": pop_sync_value("sync_ssh_port", 22),
     }
+    is_worker = distributed_enabled and _to_int(distributed_config.get("num_machines"), 1) > 1 and _to_int(distributed_config.get("machine_rank"), 0) > 0
+    skip_local_path_validation = is_worker and _to_bool(distributed_config.get("sync_missing_assets_from_main"), True)
+    if skip_local_path_validation:
+        log.info("Worker mode detected with asset sync enabled, skip local model/data validation before sync.")
 
     suggest_cpu_threads = 8 if len(train_utils.get_total_images(config["train_data_dir"])) > 200 else 2
     model_train_type = config.pop("model_train_type", "sd-lora")
     trainer_file = trainer_mapping[model_train_type]
 
-    if model_train_type != "sdxl-finetune":
+    if model_train_type != "sdxl-finetune" and not skip_local_path_validation:
         if not train_utils.validate_data_dir(config["train_data_dir"]):
             return APIResponseFail(message="训练数据集路径不存在或没有图片，请检查目录。")
 
-    validated, message = train_utils.validate_model(config["pretrained_model_name_or_path"], model_train_type)
-    if not validated:
-        return APIResponseFail(message=message)
+    if not skip_local_path_validation:
+        validated, message = train_utils.validate_model(config["pretrained_model_name_or_path"], model_train_type)
+        if not validated:
+            return APIResponseFail(message=message)
 
     if "prompt_file" in config and config["prompt_file"].strip() != "":
         prompt_file = config["prompt_file"].strip()

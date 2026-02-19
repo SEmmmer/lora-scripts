@@ -60,10 +60,10 @@ lowram=0                         # lowram mode | 低内存模式 该模式下会
 num_processes_per_machine="${NUM_PROCESSES_PER_MACHINE:-1}" # process count per machine, usually equals GPU count | 每台机器进程数，通常等于该机器 GPU 数
 num_machines="${NUM_MACHINES:-1}"                           # machine count | 机器总数
 machine_rank="${MACHINE_RANK:-0}"                           # this machine rank, main node = 0 | 当前机器 rank，主节点为 0
-main_process_ip="${MAIN_PROCESS_IP:-10.0.0.231}"            # main node IP | 主节点 IP
+main_process_ip="${MAIN_PROCESS_IP:-192.168.50.219}"        # main node IP | 主节点 IP
 main_process_port="${MAIN_PROCESS_PORT:-29500}"             # main node port | 主节点端口
-nccl_socket_ifname="${NCCL_SOCKET_IFNAME:-}"                # optional NIC for NCCL, e.g. eth0 / enp3s0
-gloo_socket_ifname="${GLOO_SOCKET_IFNAME:-}"                # optional NIC for GLOO, e.g. eth0 / enp3s0
+nccl_socket_ifname="${NCCL_SOCKET_IFNAME:-enp11s0}"         # optional NIC for NCCL, e.g. eth0 / enp3s0
+gloo_socket_ifname="${GLOO_SOCKET_IFNAME:-enp11s0}"         # optional NIC for GLOO, e.g. eth0 / enp3s0
 
 # LyCORIS 训练设置
 algo="lora"  # LyCORIS network algo | LyCORIS 网络算法 可选 lora、loha、lokr、ia3、dylora。lora即为locon

@@ -1,6 +1,39 @@
 (function () {
     const SAMPLE_PROMPTS_DEFAULT = "(masterpiece, best quality:1.2), 1girl, solo, --n lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts,signature, watermark, username, blurry,  --w 512  --h 768  --l 7  --s 24  --d 1337"
     const SAMPLE_PROMPTS_DESCRIPTION = "预览图生成参数。可填写直接填写参数，或单独写入txt文件填写路径<br>`--n` 后方为反向提示词<br>`--w`宽，`--h`高<br>`--l`: CFG Scale<br>`--s`: 迭代步数<br>`--d`: 种子"
+    const DISTRIBUTED_MAIN_TOML_DEFAULT = "./config/autosave/distributed-main-latest.toml"
+
+    function getNetworkIfnameOptions() {
+        const raw = window.__MIKAZUKI__ && Array.isArray(window.__MIKAZUKI__.NETWORK_INTERFACE_OPTIONS)
+            ? window.__MIKAZUKI__.NETWORK_INTERFACE_OPTIONS
+            : []
+
+        const options = []
+        const seen = new Set()
+
+        const pushOption = (value, label) => {
+            const safeValue = typeof value === "string" ? value : ""
+            if (seen.has(safeValue)) return
+            seen.add(safeValue)
+            options.push({
+                value: safeValue,
+                label: typeof label === "string" && label !== "" ? label : safeValue
+            })
+        }
+
+        pushOption("", "自动选择")
+        raw.forEach((item) => pushOption(item && item.value, item && item.label))
+
+        return options
+    }
+
+    function createIfnameSchema(defaultIfname) {
+        const options = getNetworkIfnameOptions()
+        const unionItems = options.map((item) => Schema.const(item.value).description(item.label))
+        const schema = Schema.union(unionItems)
+        const hasDefault = options.some((item) => item.value === defaultIfname)
+        return schema.default(hasDefault ? defaultIfname : "")
+    }
 
     let data = {
         RAW: {
@@ -233,15 +266,28 @@
         }).description("其他设置"),
 
         DISTRIBUTED_TRAINING: Schema.object({
+            enable_distributed_training: Schema.boolean().default(false).description("启用/关闭跨机分布式训练"),
             ddp_timeout: Schema.number().min(0).description("分布式训练超时时间"),
             ddp_gradient_as_bucket_view: Schema.boolean(),
             num_processes: Schema.number().min(1).description("每台机器进程数（通常等于每台机器使用的 GPU 数），不填则自动按已选 GPU 数推断"),
-            num_machines: Schema.number().min(1).default(1).description("机器总数。单机填 1，双机填 2"),
+            num_machines: Schema.number().min(1).default(2).description("机器总数。单机填 1，双机填 2"),
             machine_rank: Schema.number().min(0).default(0).description("当前机器编号。主机填 0，从机填 1"),
-            main_process_ip: Schema.string().default("10.0.0.231").description("主机 IP（machine_rank=0 的机器 IP）"),
+            main_process_ip: Schema.string().default("192.168.50.219").description("主机 IP（machine_rank=0 的机器 IP）"),
             main_process_port: Schema.number().min(1).max(65535).default(29500).description("主机端口，所有机器保持一致"),
-            nccl_socket_ifname: Schema.string().default("wg0").description("NCCL 通信网卡名，如 eth0 / eno1 / wg0"),
-            gloo_socket_ifname: Schema.string().default("wg0").description("GLOO 通信网卡名，如 eth0 / eno1 / wg0"),
+            nccl_socket_ifname: createIfnameSchema("enp11s0").description("NCCL 通信网卡名（启动时读取本机网卡并标注速率）"),
+            gloo_socket_ifname: createIfnameSchema("enp11s0").description("GLOO 通信网卡名（启动时读取本机网卡并标注速率）"),
+            sync_from_main_settings: Schema.object({
+                sync_config_from_main: Schema.boolean().default(true).description("从机启动前从主机同步关键训练参数"),
+                sync_config_keys_from_main: Schema.string().default("train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision").description("从主机同步的参数键名，逗号分隔"),
+                sync_missing_assets_from_main: Schema.boolean().default(true).description("从机若缺少底模/数据集/resume 等路径时，从主机复制到本地同路径"),
+                sync_asset_keys: Schema.string().default("pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume").description("需要检查并按需同步的路径键名，逗号分隔"),
+                sync_main_repo_dir: Schema.string().default("/home/emmmer/lora-scripts-multi").description("主机仓库根目录（用于解析相对路径）"),
+                sync_main_toml: Schema.string().default(DISTRIBUTED_MAIN_TOML_DEFAULT).description("主机 toml 配置文件路径"),
+                sync_ssh_user: Schema.string().description("SSH 用户名。留空则用当前用户"),
+                sync_ssh_port: Schema.number().min(1).max(65535).default(22).description("SSH 端口"),
+                sync_use_password_auth: Schema.boolean().default(true).description("使用密码认证同步（通过 sshpass），关闭后使用系统默认 SSH 认证方式"),
+                sync_ssh_password: Schema.string().description("SSH 密码。建议优先使用环境变量 MIKAZUKI_SYNC_SSH_PASSWORD，避免明文保存"),
+            }).description("从主机同步设置（副机）").collapse(true),
         }).description("分布式训练"),
 
     }

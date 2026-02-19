@@ -70,6 +70,13 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                 clean_memory_on_device(accelerator.device)
 
             # When TE is not be trained, it will not be prepared so we need to use explicit autocast
+            cache_writer = (
+                accelerator.is_local_main_process if args.cache_text_encoder_outputs_to_disk else accelerator.is_main_process
+            )
+            logger.info(
+                f"cache_text_encoder_outputs writer role: is_local_main_process={accelerator.is_local_main_process}, "
+                f"is_main_process={accelerator.is_main_process}, use_writer={cache_writer}"
+            )
             with accelerator.autocast():
                 dataset.cache_text_encoder_outputs(
                     tokenizers,
@@ -77,7 +84,7 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                     accelerator.device,
                     weight_dtype,
                     args.cache_text_encoder_outputs_to_disk,
-                    accelerator.is_main_process,
+                    cache_writer,
                 )
 
             text_encoders[0].to("cpu", dtype=torch.float32)  # Text Encoder doesn't work with fp16 on CPU

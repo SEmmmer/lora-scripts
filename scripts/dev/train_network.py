@@ -179,6 +179,9 @@ class NetworkTrainer:
         text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
         # モデルに xformers とか memory efficient attention を組み込む
+        args.mem_eff_attn, args.xformers, args.sdpa = train_util.resolve_attention_backend(
+            args.mem_eff_attn, args.xformers, args.sdpa
+        )
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
@@ -1332,7 +1335,7 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         progress_bar = tqdm(
-            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+            range(args.max_train_steps - initial_step), smoothing=0.5, disable=not accelerator.is_local_main_process, desc="steps"
         )
 
         validation_steps = (
@@ -1518,7 +1521,7 @@ class NetworkTrainer:
 
                     val_progress_bar = tqdm(
                         range(validation_total_steps),
-                        smoothing=0,
+                        smoothing=0.5,
                         disable=not accelerator.is_local_main_process,
                         desc="validation steps",
                     )
@@ -1594,7 +1597,7 @@ class NetworkTrainer:
 
                 val_progress_bar = tqdm(
                     range(validation_total_steps),
-                    smoothing=0,
+                    smoothing=0.5,
                     disable=not accelerator.is_local_main_process,
                     desc="epoch validation steps",
                 )

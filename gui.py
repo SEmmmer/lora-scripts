@@ -10,7 +10,7 @@ from mikazuki.launch_utils import (base_dir_path, catch_exception, git_tag,
 from mikazuki.log import log
 
 parser = argparse.ArgumentParser(description="GUI for stable diffusion training")
-parser.add_argument("--host", type=str, default="127.0.0.1")
+parser.add_argument("--host", type=str, default="0.0.0.0")
 parser.add_argument("--port", type=int, default=28000, help="Port to run the server on")
 parser.add_argument("--listen", action="store_true")
 parser.add_argument("--skip-prepare-environment", action="store_true")
@@ -18,7 +18,7 @@ parser.add_argument("--skip-prepare-onnxruntime", action="store_true")
 parser.add_argument("--disable-tensorboard", action="store_true")
 parser.add_argument("--disable-tageditor", action="store_true")
 parser.add_argument("--disable-auto-mirror", action="store_true")
-parser.add_argument("--tensorboard-host", type=str, default="127.0.0.1", help="Port to run the tensorboard")
+parser.add_argument("--tensorboard-host", type=str, default="0.0.0.0", help="Port to run the tensorboard")
 parser.add_argument("--tensorboard-port", type=int, default=6006, help="Port to run the tensorboard")
 parser.add_argument("--localization", type=str)
 parser.add_argument("--dev", action="store_true")
@@ -86,15 +86,15 @@ def launch():
 
     log.info(f"SD-Trainer Version: {git_tag(base_dir_path())}")
 
+    if args.listen:
+        args.host = "0.0.0.0"
+        args.tensorboard_host = "0.0.0.0"
+
     os.environ["MIKAZUKI_HOST"] = args.host
     os.environ["MIKAZUKI_PORT"] = str(args.port)
     os.environ["MIKAZUKI_TENSORBOARD_HOST"] = args.tensorboard_host
     os.environ["MIKAZUKI_TENSORBOARD_PORT"] = str(args.tensorboard_port)
     os.environ["MIKAZUKI_DEV"] = "1" if args.dev else "0"
-
-    if args.listen:
-        args.host = "0.0.0.0"
-        args.tensorboard_host = "0.0.0.0"
 
     if not args.disable_tageditor:
         run_tag_editor()
