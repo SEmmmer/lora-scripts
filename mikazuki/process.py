@@ -527,9 +527,8 @@ def _sync_config_from_main(
     local_config = toml.load(toml_path)
 
     candidate_paths = []
-    if sync_main_toml:
-        candidate_paths.append(_resolve_remote_path(sync_main_toml, remote_repo_root))
-
+    resolved_sync_main_toml = _resolve_remote_path(sync_main_toml, remote_repo_root) if sync_main_toml else ""
+    default_distributed_main_toml = str(Path(remote_repo_root) / "config" / "autosave" / "distributed-main-latest.toml")
     latest_toml_path = _get_latest_remote_toml(
         remote_host,
         ssh_port,
@@ -537,13 +536,33 @@ def _sync_config_from_main(
         use_password_auth=use_password_auth,
         ssh_password=ssh_password,
     )
-    if latest_toml_path:
+
+    # When using default distributed-main-latest path, it may lag behind the
+    # newest autosave TOML during startup race. Try newest autosave first.
+    prefer_latest_first = (
+        bool(latest_toml_path)
+        and bool(resolved_sync_main_toml)
+        and os.path.normpath(resolved_sync_main_toml) == os.path.normpath(default_distributed_main_toml)
+        and latest_toml_path != resolved_sync_main_toml
+    )
+    if prefer_latest_first:
+        log.info(
+            "[sync-config] detected potential stale distributed-main-latest, "
+            f"prefer latest autosave first: latest={latest_toml_path}, "
+            f"fallback={resolved_sync_main_toml}"
+        )
+
+    if prefer_latest_first and latest_toml_path:
+        candidate_paths.append(latest_toml_path)
+    if resolved_sync_main_toml:
+        candidate_paths.append(resolved_sync_main_toml)
+    if (not prefer_latest_first) and latest_toml_path:
         candidate_paths.append(latest_toml_path)
 
     local_toml_name = Path(toml_path).name
     candidate_paths.extend(
         [
-            str(Path(remote_repo_root) / "config" / "autosave" / "distributed-main-latest.toml"),
+            default_distributed_main_toml,
             str(Path(remote_repo_root) / "config" / "autosave" / local_toml_name),
             str(Path(remote_repo_root) / "config" / "default.toml"),
             str(Path(remote_repo_root) / "config" / "lora.toml"),
