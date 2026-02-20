@@ -26,6 +26,7 @@ DEFAULT_SYNC_CONFIG_KEYS = "*"
 DEFAULT_SYNC_ASSET_KEYS = "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"
 WORKER_OUTPUT_MARKER = "THIS_IS_WORKER_NODE_CHECK_MAIN_OUTPUTS"
 DATASET_DIR_KEYS = ("train_data_dir", "reg_data_dir")
+SYNCED_MAIN_TOML_LATEST_NAME = "distributed-main-synced-latest.toml"
 
 
 def _to_bool(value, default=False):
@@ -513,6 +514,23 @@ def _find_first_remote_file(
     return None
 
 
+def _store_synced_main_toml_locally(main_toml_text: str) -> Tuple[bool, str, Optional[str]]:
+    autosave_dir = base_dir_path() / "config" / "autosave"
+    autosave_dir.mkdir(parents=True, exist_ok=True)
+
+    latest_file = autosave_dir / SYNCED_MAIN_TOML_LATEST_NAME
+    snapshot_file = autosave_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-distributed-main-synced.toml"
+    try:
+        latest_file.write_text(main_toml_text, encoding="utf-8")
+        snapshot_file.write_text(main_toml_text, encoding="utf-8")
+    except Exception as e:
+        return False, f"写入本地同步 toml 失败: {e}", None
+
+    log.info(f"[sync-config] synced main toml to local: {latest_file}")
+    log.info(f"[sync-config] synced main toml snapshot: {snapshot_file}")
+    return True, "", str(latest_file)
+
+
 def _sync_config_from_main(
     toml_path: str,
     remote_host: str,
@@ -537,27 +555,11 @@ def _sync_config_from_main(
         ssh_password=ssh_password,
     )
 
-    # When using default distributed-main-latest path, it may lag behind the
-    # newest autosave TOML during startup race. Try newest autosave first.
-    prefer_latest_first = (
-        bool(latest_toml_path)
-        and bool(resolved_sync_main_toml)
-        and os.path.normpath(resolved_sync_main_toml) == os.path.normpath(default_distributed_main_toml)
-        and latest_toml_path != resolved_sync_main_toml
-    )
-    if prefer_latest_first:
-        log.info(
-            "[sync-config] detected potential stale distributed-main-latest, "
-            f"prefer latest autosave first: latest={latest_toml_path}, "
-            f"fallback={resolved_sync_main_toml}"
-        )
-
-    if prefer_latest_first and latest_toml_path:
+    # Always try the newest autosave first, then fallback to configured path.
+    if latest_toml_path:
         candidate_paths.append(latest_toml_path)
     if resolved_sync_main_toml:
         candidate_paths.append(resolved_sync_main_toml)
-    if (not prefer_latest_first) and latest_toml_path:
-        candidate_paths.append(latest_toml_path)
 
     local_toml_name = Path(toml_path).name
     candidate_paths.extend(
@@ -581,6 +583,7 @@ def _sync_config_from_main(
         return False, f"无法构建主机 toml 候选路径。remote_host={remote_host}, remote_repo_root={remote_repo_root}"
 
     main_config = None
+    local_synced_main_toml = None
     used_toml_path = None
     errors = []
     for candidate in dedup_paths:
@@ -606,13 +609,19 @@ def _sync_config_from_main(
             errors.append(f"{candidate} (read failed: {read_err})")
             continue
 
+        ok, store_msg, local_synced_path = _store_synced_main_toml_locally(text)
+        if not ok:
+            errors.append(f"{candidate} (sync local failed: {store_msg})")
+            continue
+
         try:
-            parsed = toml.loads(text)
+            parsed = toml.load(local_synced_path)
         except Exception as e:
             errors.append(f"{candidate} (toml parse failed: {e})")
             continue
 
         main_config = parsed
+        local_synced_main_toml = local_synced_path
         used_toml_path = candidate
         break
 
@@ -624,6 +633,8 @@ def _sync_config_from_main(
         )
 
     log.info(f"[sync-config] use main toml: {used_toml_path}")
+    if local_synced_main_toml:
+        log.info(f"[sync-config] read config from local synced toml: {local_synced_main_toml}")
 
     sync_all = any(str(k).strip().lower() in {"*", "__all__", "all"} for k in sync_keys)
     keys_to_sync = list(main_config.keys()) if sync_all else sync_keys
