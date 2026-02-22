@@ -1,7 +1,9 @@
 import argparse
+import importlib.util
 import locale
 import os
 import platform
+import socket
 import subprocess
 import sys
 
@@ -23,17 +25,53 @@ parser.add_argument("--localization", type=str)
 parser.add_argument("--dev", action="store_true")
 
 
+def resolve_lan_ip() -> str | None:
+    # Prefer the active outbound interface address.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+
+    # Fallback to host-resolved IPv4 addresses.
+    try:
+        host = socket.gethostname()
+        for item in socket.getaddrinfo(host, None, family=socket.AF_INET):
+            ip = item[4][0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+
+    return None
+
+
 @catch_exception
 def run_tensorboard():
-    try:
-        import pkg_resources  # noqa: F401
-    except ModuleNotFoundError:
-        log.warning("pkg_resources not found, skip tensorboard. Install setuptools in venv to enable tensorboard.")
+    if importlib.util.find_spec("tensorboard.main") is None:
+        log.warning(
+            "tensorboard module not found, skip tensorboard. "
+            "Install dependencies in venv first (e.g. run install script)."
+        )
         return
 
     log.info("Starting tensorboard...")
-    subprocess.Popen([sys.executable, "-m", "tensorboard.main", "--logdir", "logs",
-                     "--host", args.tensorboard_host, "--port", str(args.tensorboard_port)])
+    subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "mikazuki.tensorboard_launcher",
+            "--logdir",
+            "logs",
+            "--host",
+            args.tensorboard_host,
+            "--port",
+            str(args.tensorboard_port),
+        ]
+    )
 
 
 @catch_exception
@@ -106,7 +144,16 @@ def launch():
         run_tensorboard()
 
     import uvicorn
-    log.info(f"Server started at http://{args.host}:{args.port}")
+    if args.host == "0.0.0.0":
+        local_url = f"http://127.0.0.1:{args.port}"
+        lan_ip = resolve_lan_ip()
+        lan_url = f"http://{lan_ip}:{args.port}" if lan_ip else f"http://<your-lan-ip>:{args.port}"
+        log.info("Server started and listening on 0.0.0.0.")
+        log.info(f"Please visit (Local): {local_url}")
+        log.info(f"Please visit (LAN):   {lan_url}")
+        log.info("Any device on the same LAN can access this service.")
+    else:
+        log.info(f"Server started. Please visit: http://{args.host}:{args.port}")
     uvicorn.run("mikazuki.app:app", host=args.host, port=args.port, log_level="error", reload=args.dev)
 
 
