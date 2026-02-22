@@ -9,8 +9,14 @@ $save_to = "./output/lora_name_new.safetensors" # output LoRA model path, save a
 $device = "cuda" # device to use, cuda for GPU | 使用 GPU跑, 默认 CPU
 $new_conv_rank = 0 # Specify rank of output LoRA for Conv2d 3x3, None for same as new_rank | Conv2d 3x3输出，没有默认同new_rank
 
-# Activate python venv
-.\venv\Scripts\activate
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ScriptDir
+
+$pythonPath = ".\venv\Scripts\python.exe"
+if (-not (Test-Path $pythonPath)) {
+  throw "embedded venv python not found ($pythonPath). Run .\install.ps1 first."
+}
+$pythonBin = (Resolve-Path $pythonPath).Path
 
 $Env:HF_HOME = "huggingface"
 $Env:XFORMERS_FORCE_DISABLE_TRITON = "1"
@@ -31,7 +37,7 @@ if ($new_conv_rank) {
 }
 
 # run svd_merge
-accelerate launch --num_cpu_threads_per_process=8 "./scripts/stable/networks/svd_merge_lora.py" `
+& $pythonBin -m accelerate.commands.launch --num_cpu_threads_per_process=8 "./scripts/stable/networks/svd_merge_lora.py" `
 	--save_precision=$save_precision `
 	--precision=$precision `
 	--new_rank=$new_rank `

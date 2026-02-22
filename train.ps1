@@ -81,24 +81,10 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
 function Resolve-PythonBin {
-    if ($env:PYTHON_BIN) {
-        if (Test-Path $env:PYTHON_BIN) {
-            return (Resolve-Path $env:PYTHON_BIN).Path
-        }
-        if (Get-Command $env:PYTHON_BIN -ErrorAction SilentlyContinue) {
-            return $env:PYTHON_BIN
-        }
-    }
     if (Test-Path ".\venv\Scripts\python.exe") {
         return (Resolve-Path ".\venv\Scripts\python.exe").Path
     }
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        return "python"
-    }
-    if (Get-Command py -ErrorAction SilentlyContinue) {
-        return "py"
-    }
-    throw "python executable not found. Please install dependencies first."
+    throw "embedded venv python not found (.\\venv\\Scripts\\python.exe). Run .\\install.ps1 first."
 }
 
 $pythonBin = Resolve-PythonBin

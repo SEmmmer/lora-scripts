@@ -6,37 +6,17 @@ $Env:PYTHONUTF8 = "1"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
-function Test-HelpRequest {
-    param([string[]]$CliArgs)
-    foreach ($arg in $CliArgs) {
-        if ($arg -eq "-h" -or $arg -eq "--help") {
-            return $true
-        }
-    }
-    return $false
-}
-
 function Resolve-PythonBin {
     if (Test-Path ".\venv\Scripts\python.exe") {
         return (Resolve-Path ".\venv\Scripts\python.exe").Path
     }
-    if (Test-Path ".\python\python.exe") {
-        return (Resolve-Path ".\python\python.exe").Path
-    }
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        return "python"
-    }
-    throw "python executable not found. Please install Python 3 first."
+    throw "embedded venv python not found (.\\venv\\Scripts\\python.exe). Run .\\install.ps1 first."
 }
 
 function Ensure-VenvOrInstall {
     param([string[]]$CliArgs)
 
     if (Test-Path ".\venv\Scripts\python.exe") {
-        return
-    }
-
-    if (Test-HelpRequest $CliArgs) {
         return
     }
 

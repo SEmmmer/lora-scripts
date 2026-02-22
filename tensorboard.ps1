@@ -5,14 +5,10 @@ Set-Location $ScriptDir
 
 $Env:TF_CPP_MIN_LOG_LEVEL = "3"
 
-if (Test-Path ".\venv\Scripts\python.exe") {
-    $pythonBin = (Resolve-Path ".\venv\Scripts\python.exe").Path
+$pythonPath = ".\venv\Scripts\python.exe"
+if (-not (Test-Path $pythonPath)) {
+    throw "embedded venv python not found ($pythonPath). Please run install.ps1 first."
 }
-elseif (Get-Command python -ErrorAction SilentlyContinue) {
-    $pythonBin = "python"
-}
-else {
-    throw "python executable not found. Please run install.ps1 first."
-}
+$pythonBin = (Resolve-Path $pythonPath).Path
 
 & $pythonBin -m mikazuki.tensorboard_launcher --logdir logs --host 127.0.0.1 --port 6006 @args

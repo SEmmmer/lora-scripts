@@ -83,16 +83,11 @@ export TF_CPP_MIN_LOG_LEVEL=3
 if [[ -n "$nccl_socket_ifname" ]]; then export NCCL_SOCKET_IFNAME="$nccl_socket_ifname"; fi
 if [[ -n "$gloo_socket_ifname" ]]; then export GLOO_SOCKET_IFNAME="$gloo_socket_ifname"; fi
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  if command -v python3 >/dev/null 2>&1; then
-    PYTHON_BIN="python3"
-  elif command -v python >/dev/null 2>&1; then
-    PYTHON_BIN="python"
-  else
-    echo "Error: python3/python not found"
-    exit 1
-  fi
+PYTHON_BIN="./venv/bin/python"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "Error: embedded venv python not found at $PYTHON_BIN"
+  echo "Run 'bash install.bash' first."
+  exit 1
 fi
 
 extArgs=()

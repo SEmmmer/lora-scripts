@@ -6,9 +6,14 @@ $model = "./output/LoRA.safetensors" # LoRA model to interrogate: ckpt or safete
 $batch_size = 64 # batch size for processing with Text Encoder | 使用 Text Encoder 处理时的批量大小，默认16，推荐64/128
 $clip_skip = 1 # use output of nth layer from back of text encoder (n>=1) | 使用文本编码器倒数第 n 层的输出，n 可以是大于等于 1 的整数
 
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ScriptDir
 
-# Activate python venv
-.\venv\Scripts\activate
+$pythonPath = ".\venv\Scripts\python.exe"
+if (-not (Test-Path $pythonPath)) {
+  throw "embedded venv python not found ($pythonPath). Run .\install.ps1 first."
+}
+$pythonBin = (Resolve-Path $pythonPath).Path
 
 $Env:HF_HOME = "huggingface"
 $ext_args = [System.Collections.ArrayList]::new()
@@ -18,7 +23,7 @@ if ($v2) {
 }
 
 # run interrogate
-accelerate launch --num_cpu_threads_per_process=8 "./scripts/stable/networks/lora_interrogator.py" `
+& $pythonBin -m accelerate.commands.launch --num_cpu_threads_per_process=8 "./scripts/stable/networks/lora_interrogator.py" `
 	--sd_model=$sd_model `
 	--model=$model `
 	--batch_size=$batch_size `

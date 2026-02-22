@@ -19,6 +19,12 @@ frequency_tags=0 # order by frequency tags | 从大到小按识别率排序标�
 
 export HF_HOME="huggingface"
 export TF_CPP_MIN_LOG_LEVEL=3
+PYTHON_BIN="./venv/bin/python"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "Error: embedded venv python not found at $PYTHON_BIN"
+  echo "Run 'bash install.bash' first."
+  exit 1
+fi
 extArgs=()
 
 if [ -n "$repo_id" ]; then
@@ -63,7 +69,7 @@ fi
 
 
 # run tagger
-accelerate launch --num_cpu_threads_per_process=8 "./scripts/stable/finetune/tag_images_by_wd14_tagger.py" \
+"$PYTHON_BIN" -m accelerate.commands.launch --num_cpu_threads_per_process=8 "./scripts/stable/finetune/tag_images_by_wd14_tagger.py" \
   $train_data_dir \
   --thresh=$thresh \
   --caption_extension .txt \

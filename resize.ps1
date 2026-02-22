@@ -9,9 +9,14 @@ $verbose = 1 # display verbose resizing information | rank变更时, 显示详�
 $dynamic_method = "" # Specify dynamic resizing method, --new_rank is used as a hard limit for max rank | 动态调节大小，可选"sv_ratio", "sv_fro", "sv_cumulative",默认无
 $dynamic_param = "" # Specify target for dynamic reduction | 动态参数,sv_ratio模式推荐1~2, sv_cumulative模式0~1, sv_fro模式0~1, 比sv_cumulative要高
 
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ScriptDir
 
-# Activate python venv
-.\venv\Scripts\activate
+$pythonPath = ".\venv\Scripts\python.exe"
+if (-not (Test-Path $pythonPath)) {
+  throw "embedded venv python not found ($pythonPath). Run .\install.ps1 first."
+}
+$pythonBin = (Resolve-Path $pythonPath).Path
 
 $Env:HF_HOME = "huggingface"
 $ext_args = [System.Collections.ArrayList]::new()
@@ -29,7 +34,7 @@ if ($dynamic_param) {
 }
 
 # run resize
-accelerate launch --num_cpu_threads_per_process=8 "./scripts/networks/resize_lora.py" `
+& $pythonBin -m accelerate.commands.launch --num_cpu_threads_per_process=8 "./scripts/networks/resize_lora.py" `
 	--save_precision=$save_precision `
 	--new_rank=$new_rank `
 	--model=$model `
