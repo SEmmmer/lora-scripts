@@ -16,6 +16,7 @@ git
 wd14_tagger_model
 
 train/*
+!train/.keep
 logs/*
 sd-models/*
 toml/autosave/*

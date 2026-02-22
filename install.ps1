@@ -139,7 +139,12 @@ try {
     if (-not $DisableVenv) {
         $venvPythonPath = ".\venv\Scripts\python.exe"
         if (Test-Path $venvPythonPath) {
-            $venvPythonVersion = Get-PythonMajorMinor (Resolve-Path $venvPythonPath).Path
+            try {
+                $venvPythonVersion = Get-PythonMajorMinor (Resolve-Path $venvPythonPath).Path
+            }
+            catch {
+                throw "failed to inspect existing venv python at $venvPythonPath. remove venv manually and rerun installer (PowerShell: Remove-Item .\venv -Recurse -Force; bash: rm -rf ./venv)"
+            }
             if ($venvPythonVersion -ne $embeddedPythonRuntimeVersion) {
                 Write-Output "Existing venv python version $venvPythonVersion does not match embedded python $embeddedPythonRuntimeVersion. Recreating venv..."
                 Remove-Item -Path ".\venv" -Recurse -Force
@@ -161,7 +166,15 @@ try {
         Write-Output "Using embedded python (venv disabled): $pythonBin"
     }
 
-    $activePythonVersion = Get-PythonMajorMinor $pythonBin
+    try {
+        $activePythonVersion = Get-PythonMajorMinor $pythonBin
+    }
+    catch {
+        if (-not $DisableVenv) {
+            throw "failed to inspect active venv python at $pythonBin. remove venv manually and rerun installer (PowerShell: Remove-Item .\venv -Recurse -Force; bash: rm -rf ./venv)"
+        }
+        throw
+    }
     if ($activePythonVersion -ne $embeddedPythonRuntimeVersion) {
         throw "active python version $activePythonVersion does not match embedded python version $embeddedPythonRuntimeVersion"
     }

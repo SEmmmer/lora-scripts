@@ -49,6 +49,11 @@ def resolve_lan_ip() -> str | None:
     return None
 
 
+def is_ipv6_host(host: str) -> bool:
+    h = (host or "").strip()
+    return h.startswith("[") or ":" in h
+
+
 @catch_exception
 def run_tensorboard():
     if importlib.util.find_spec("tensorboard.main") is None:
@@ -130,6 +135,10 @@ def launch():
             log.warning("--listen is set, force host and tensorboard-host to 0.0.0.0")
         args.host = "0.0.0.0"
         args.tensorboard_host = "0.0.0.0"
+
+    if is_ipv6_host(args.host) or is_ipv6_host(args.tensorboard_host):
+        log.error("IPv6 is disabled in this project. Please use IPv4 host (e.g. 0.0.0.0 / 127.0.0.1).")
+        sys.exit(1)
 
     os.environ["MIKAZUKI_HOST"] = args.host
     os.environ["MIKAZUKI_PORT"] = str(args.port)

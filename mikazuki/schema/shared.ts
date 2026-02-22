@@ -2,6 +2,9 @@
     const SAMPLE_PROMPTS_DEFAULT = "(masterpiece, best quality:1.2), 1girl, solo, --n lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts,signature, watermark, username, blurry,  --w 512  --h 768  --l 7  --s 24  --d 1337"
     const SAMPLE_PROMPTS_DESCRIPTION = "预览图生成参数。可填写直接填写参数，或单独写入txt文件填写路径<br>`--n` 后方为反向提示词<br>`--w`宽，`--h`高<br>`--l`: CFG Scale<br>`--s`: 迭代步数<br>`--d`: 种子"
     const DISTRIBUTED_MAIN_TOML_DEFAULT = "./config/autosave/distributed-main-latest.toml"
+    const SYNC_MAIN_REPO_DIR_DEFAULT = (window.__MIKAZUKI__ && typeof window.__MIKAZUKI__.SYNC_MAIN_REPO_DIR_DEFAULT === "string" && window.__MIKAZUKI__.SYNC_MAIN_REPO_DIR_DEFAULT !== "")
+        ? window.__MIKAZUKI__.SYNC_MAIN_REPO_DIR_DEFAULT
+        : "."
 
     function getNetworkIfnameOptions() {
         const raw = window.__MIKAZUKI__ && Array.isArray(window.__MIKAZUKI__.NETWORK_INTERFACE_OPTIONS)
@@ -281,7 +284,7 @@
                 sync_config_keys_from_main: Schema.string().default("train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision").description("从主机同步的参数键名，逗号分隔"),
                 sync_missing_assets_from_main: Schema.boolean().default(true).description("从机若缺少底模/数据集/resume 等路径时，从主机复制到本地同路径"),
                 sync_asset_keys: Schema.string().default("pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume").description("需要检查并按需同步的路径键名，逗号分隔"),
-                sync_main_repo_dir: Schema.string().default("/home/emmmer/lora-scripts-multi").description("主机仓库根目录（用于解析相对路径）"),
+                sync_main_repo_dir: Schema.string().default(SYNC_MAIN_REPO_DIR_DEFAULT).description("主机仓库根目录（用于解析相对路径）"),
                 sync_main_toml: Schema.string().default(DISTRIBUTED_MAIN_TOML_DEFAULT).description("主机 toml 配置文件路径"),
                 sync_ssh_user: Schema.string().description("SSH 用户名。留空则用当前用户"),
                 sync_ssh_port: Schema.number().min(1).max(65535).default(22).description("SSH 端口"),

@@ -138,7 +138,12 @@ echo "Embedded python version: $EMBEDDED_PYTHON_RUNTIME_VERSION"
 
 if $create_venv; then
   if [[ -x "$script_dir/venv/bin/python" ]]; then
-    VENV_PYTHON_VERSION="$(get_python_major_minor "$script_dir/venv/bin/python")"
+    if ! VENV_PYTHON_VERSION="$(get_python_major_minor "$script_dir/venv/bin/python" 2>/dev/null)"; then
+      echo "Failed to inspect existing venv python: $script_dir/venv/bin/python"
+      echo "Please remove broken venv manually and rerun installer:"
+      echo "  rm -rf \"$script_dir/venv\""
+      exit 1
+    fi
     if [[ "$VENV_PYTHON_VERSION" != "$EMBEDDED_PYTHON_RUNTIME_VERSION" ]]; then
       echo "Existing venv python version $VENV_PYTHON_VERSION does not match embedded python $EMBEDDED_PYTHON_RUNTIME_VERSION. Recreating venv..."
       rm -rf "$script_dir/venv"
@@ -154,7 +159,14 @@ else
   PYTHON_BIN="$EMBEDDED_PYTHON_BIN"
 fi
 
-ACTIVE_PYTHON_VERSION="$(get_python_major_minor "$PYTHON_BIN")"
+if ! ACTIVE_PYTHON_VERSION="$(get_python_major_minor "$PYTHON_BIN" 2>/dev/null)"; then
+  echo "Failed to inspect active python runtime: $PYTHON_BIN"
+  if $create_venv; then
+    echo "Please remove broken venv manually and rerun installer:"
+    echo "  rm -rf \"$script_dir/venv\""
+  fi
+  exit 1
+fi
 if [[ "$ACTIVE_PYTHON_VERSION" != "$EMBEDDED_PYTHON_RUNTIME_VERSION" ]]; then
   echo "Active python version $ACTIVE_PYTHON_VERSION does not match embedded python version $EMBEDDED_PYTHON_RUNTIME_VERSION"
   exit 1

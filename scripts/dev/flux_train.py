@@ -185,6 +185,7 @@ def train(args):
     # acceleratorを準備する
     logger.info("prepare accelerator")
     accelerator = train_util.prepare_accelerator(args)
+    is_saving_process = accelerator.is_local_main_process
 
     # mixed precisionに対応した型を用意しておき適宜castする
     weight_dtype, save_dtype = train_util.prepare_dtype(args)
@@ -712,7 +713,7 @@ def train(args):
                 # 指定ステップごとにモデルを保存
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                     accelerator.wait_for_everyone()
-                    if accelerator.is_main_process:
+                    if is_saving_process:
                         flux_train_utils.save_flux_model_on_epoch_end_or_stepwise(
                             args,
                             False,
@@ -748,7 +749,7 @@ def train(args):
 
         optimizer_eval_fn()
         if args.save_every_n_epochs is not None:
-            if accelerator.is_main_process:
+            if is_saving_process:
                 flux_train_utils.save_flux_model_on_epoch_end_or_stepwise(
                     args,
                     True,
@@ -765,19 +766,18 @@ def train(args):
         )
         optimizer_train_fn()
 
-    is_main_process = accelerator.is_main_process
-    # if is_main_process:
+    # if is_saving_process:
     flux = accelerator.unwrap_model(flux)
 
     accelerator.end_training()
     optimizer_eval_fn()
 
-    if args.save_state or args.save_state_on_train_end:
+    if is_saving_process and (args.save_state or args.save_state_on_train_end):
         train_util.save_state_on_train_end(args, accelerator)
 
     del accelerator  # この後メモリを使うのでこれは消す
 
-    if is_main_process:
+    if is_saving_process:
         flux_train_utils.save_flux_model_on_train_end(args, save_dtype, epoch, global_step, flux)
         logger.info("model saved.")
 

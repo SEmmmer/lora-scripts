@@ -72,6 +72,61 @@ def _resolve_lan_ip() -> str | None:
     return None
 
 
+def _is_ipv6_host(host: str) -> bool:
+    h = (host or "").strip()
+    return h.startswith("[") or ":" in h
+
+
+def _enforce_ipv4_only(argv: list[str]) -> list[str]:
+    new_argv = [argv[0]]
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+
+        if arg == "--bind_all":
+            print(
+                "IPv6/bind_all mode is disabled in this project; ignoring --bind_all.",
+                file=sys.stderr,
+            )
+            i += 1
+            continue
+
+        if arg == "--host":
+            if i + 1 < len(argv):
+                host = argv[i + 1]
+                if _is_ipv6_host(host):
+                    print(
+                        f"IPv6 host is disabled, fallback to 127.0.0.1: {host}",
+                        file=sys.stderr,
+                    )
+                    new_argv.extend(["--host", "127.0.0.1"])
+                else:
+                    new_argv.extend(["--host", host])
+                i += 2
+                continue
+            new_argv.append(arg)
+            i += 1
+            continue
+
+        if arg.startswith("--host="):
+            host = arg.split("=", 1)[1]
+            if _is_ipv6_host(host):
+                print(
+                    f"IPv6 host is disabled, fallback to 127.0.0.1: {host}",
+                    file=sys.stderr,
+                )
+                new_argv.append("--host=127.0.0.1")
+            else:
+                new_argv.append(arg)
+            i += 1
+            continue
+
+        new_argv.append(arg)
+        i += 1
+
+    return new_argv
+
+
 def _ensure_default_load_fast(argv: list[str]) -> list[str]:
     for arg in argv[1:]:
         if arg == "--load_fast" or arg.startswith("--load_fast="):
@@ -134,6 +189,7 @@ def main():
     from tensorboard import main as tensorboard_main
 
     argv = ["tensorboard", *sys.argv[1:]]
+    argv = _enforce_ipv4_only(argv)
     sys.argv = _ensure_default_load_fast(argv)
     tensorboard_main.run_main()
 

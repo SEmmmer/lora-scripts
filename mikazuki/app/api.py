@@ -110,6 +110,7 @@ async def load_schemas():
     schema_dir = os.path.join(os.getcwd(), "mikazuki", "schema")
     schemas = os.listdir(schema_dir)
     network_interface_options = _get_network_interface_options()
+    detected_repo_root = os.getcwd()
 
     def lambda_hash(x):
         return hashlib.md5(x.encode()).hexdigest()
@@ -120,6 +121,7 @@ async def load_schemas():
             runtime_prelude = (
                 "window.__MIKAZUKI__ = window.__MIKAZUKI__ || {};\n"
                 f"window.__MIKAZUKI__.NETWORK_INTERFACE_OPTIONS = {json.dumps(network_interface_options, ensure_ascii=False)};\n"
+                f"window.__MIKAZUKI__.SYNC_MAIN_REPO_DIR_DEFAULT = {json.dumps(detected_repo_root, ensure_ascii=False)};\n"
             )
             content = runtime_prelude + content
             avaliable_schemas.append({

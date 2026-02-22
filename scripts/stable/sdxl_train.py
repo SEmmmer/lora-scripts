@@ -200,6 +200,7 @@ def train(args):
     # acceleratorを準備する
     logger.info("prepare accelerator")
     accelerator = train_util.prepare_accelerator(args)
+    is_saving_process = accelerator.is_local_main_process
 
     # mixed precisionに対応した型を用意しておき適宜castする
     weight_dtype, save_dtype = train_util.prepare_dtype(args)
@@ -262,8 +263,9 @@ def train(args):
         vae.to(accelerator.device, dtype=vae_dtype)
         vae.requires_grad_(False)
         vae.eval()
+        cache_writer = accelerator.is_local_main_process if args.cache_latents_to_disk else accelerator.is_main_process
         with torch.no_grad():
-            train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, accelerator.is_main_process)
+            train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, cache_writer)
         vae.to("cpu")
         clean_memory_on_device(accelerator.device)
 
@@ -307,6 +309,9 @@ def train(args):
         # TextEncoderの出力をキャッシュする
         if args.cache_text_encoder_outputs:
             # Text Encodes are eval and no grad
+            te_cache_writer = (
+                accelerator.is_local_main_process if args.cache_text_encoder_outputs_to_disk else accelerator.is_main_process
+            )
             with torch.no_grad(), accelerator.autocast():
                 train_dataset_group.cache_text_encoder_outputs(
                     (tokenizer1, tokenizer2),
@@ -314,7 +319,7 @@ def train(args):
                     accelerator.device,
                     None,
                     args.cache_text_encoder_outputs_to_disk,
-                    accelerator.is_main_process,
+                    te_cache_writer,
                 )
             accelerator.wait_for_everyone()
 
@@ -777,7 +782,7 @@ def train(args):
                 # 指定ステップごとにモデルを保存
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                     accelerator.wait_for_everyone()
-                    if accelerator.is_main_process:
+                    if is_saving_process:
                         src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
                         sdxl_train_util.save_sd_model_on_epoch_end_or_stepwise(
                             args,
@@ -823,7 +828,7 @@ def train(args):
         accelerator.wait_for_everyone()
 
         if args.save_every_n_epochs is not None:
-            if accelerator.is_main_process:
+            if is_saving_process:
                 src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
                 sdxl_train_util.save_sd_model_on_epoch_end_or_stepwise(
                     args,
@@ -856,20 +861,19 @@ def train(args):
             unet,
         )
 
-    is_main_process = accelerator.is_main_process
-    # if is_main_process:
+    # if is_saving_process:
     unet = accelerator.unwrap_model(unet)
     text_encoder1 = accelerator.unwrap_model(text_encoder1)
     text_encoder2 = accelerator.unwrap_model(text_encoder2)
 
     accelerator.end_training()
 
-    if args.save_state or args.save_state_on_train_end:
+    if is_saving_process and (args.save_state or args.save_state_on_train_end):
         train_util.save_state_on_train_end(args, accelerator)
 
     del accelerator  # この後メモリを使うのでこれは消す
 
-    if is_main_process:
+    if is_saving_process:
         src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
         sdxl_train_util.save_sd_model_on_train_end(
             args,

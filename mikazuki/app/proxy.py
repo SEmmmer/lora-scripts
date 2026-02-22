@@ -15,10 +15,18 @@ from mikazuki.log import log
 router = APIRouter()
 
 
+def _is_ipv6_host(host: str) -> bool:
+    h = (host or "").strip()
+    return h.startswith("[") or ":" in h
+
+
 def _normalize_backend_host(host: str) -> str:
     # Wildcard bind addresses are valid for servers, but not reliable
     # client targets on Windows when reverse proxying to local services.
     if host in ("0.0.0.0", "::", "[::]", "*", ""):
+        return "127.0.0.1"
+    if _is_ipv6_host(host):
+        log.warning(f"IPv6 backend host is disabled, fallback to 127.0.0.1: {host}")
         return "127.0.0.1"
     return host
 

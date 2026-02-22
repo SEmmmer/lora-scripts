@@ -279,11 +279,19 @@ def _resolve_lan_ip() -> str | None:
     return None
 
 
+def _is_ipv6_host(host: str) -> bool:
+    h = (host or "").strip()
+    return h.startswith("[") or ":" in h
+
+
 def _resolve_browser_host(host: str) -> str:
     if host in ("0.0.0.0", "::", "[::]", "*", ""):
         lan_ip = _resolve_lan_ip()
         if lan_ip:
             return lan_ip
+        return "127.0.0.1"
+    if _is_ipv6_host(host):
+        log.warning(f"IPv6 browser host is disabled, fallback to 127.0.0.1: {host}")
         return "127.0.0.1"
     return host
 

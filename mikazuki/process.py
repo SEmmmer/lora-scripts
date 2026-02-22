@@ -5,6 +5,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
@@ -26,6 +28,7 @@ DEFAULT_SYNC_CONFIG_KEYS = "*"
 DEFAULT_SYNC_ASSET_KEYS = "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"
 WORKER_OUTPUT_MARKER = "THIS_IS_WORKER_NODE_CHECK_MAIN_OUTPUTS"
 DATASET_DIR_KEYS = ("train_data_dir", "reg_data_dir")
+MESH_NET_MONITOR_INTERVAL_SECONDS = 10
 
 
 def _to_bool(value, default=False):
@@ -72,6 +75,137 @@ def _list_local_network_interfaces() -> list[str]:
         return sorted([p.name for p in net_root.iterdir() if p.is_dir()])
     except Exception:
         return []
+
+
+def _read_network_iface_stats(iface_name: str) -> Optional[dict]:
+    stat_dir = Path("/sys/class/net") / iface_name / "statistics"
+    try:
+        return {
+            "rx_bytes": int((stat_dir / "rx_bytes").read_text(encoding="utf-8").strip()),
+            "tx_bytes": int((stat_dir / "tx_bytes").read_text(encoding="utf-8").strip()),
+            "rx_packets": int((stat_dir / "rx_packets").read_text(encoding="utf-8").strip()),
+            "tx_packets": int((stat_dir / "tx_packets").read_text(encoding="utf-8").strip()),
+        }
+    except Exception:
+        return None
+
+
+def _parse_ifname_candidates(value: str) -> list[str]:
+    if not value:
+        return []
+
+    result = []
+    for token in str(value).split(","):
+        name = token.strip()
+        if not name or name.startswith("^"):
+            continue
+        result.append(name)
+    return result
+
+
+def _pick_training_mesh_iface(nccl_socket_ifname: str, gloo_socket_ifname: str, main_process_ip: str) -> str:
+    interfaces = _list_local_network_interfaces()
+    if not interfaces:
+        return ""
+    interface_set = set(interfaces)
+
+    # Highest priority: explicitly configured NCCL/GLOO interface.
+    for name in _parse_ifname_candidates(nccl_socket_ifname) + _parse_ifname_candidates(gloo_socket_ifname):
+        if name in interface_set:
+            return name
+
+    # Fallback: infer outgoing device to main process IPv4.
+    if main_process_ip and ":" not in str(main_process_ip):
+        try:
+            route = subprocess.run(
+                ["ip", "-4", "route", "get", str(main_process_ip)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if route.returncode == 0:
+                parts = route.stdout.strip().split()
+                if "dev" in parts:
+                    dev_idx = parts.index("dev") + 1
+                    if dev_idx < len(parts):
+                        route_iface = parts[dev_idx]
+                        if route_iface in interface_set:
+                            return route_iface
+        except Exception:
+            pass
+
+    # Final fallback: first non-loopback interface.
+    for iface in interfaces:
+        if iface != "lo":
+            return iface
+
+    return ""
+
+
+def _mesh_network_monitor_loop(
+    stop_event: threading.Event,
+    iface_name: str,
+    machine_rank: int,
+    num_machines: int,
+    interval_seconds: int,
+):
+    interval_seconds = max(1, int(interval_seconds))
+    begin_stats = _read_network_iface_stats(iface_name)
+    if begin_stats is None:
+        log.warning(f"[mesh-net] monitor disabled: cannot read interface stats for {iface_name}")
+        return
+
+    begin_time = time.time()
+    log.info(
+        f"[mesh-net] monitor started: iface={iface_name}, rank={machine_rank}/{num_machines - 1}, "
+        f"interval={interval_seconds}s"
+    )
+
+    while not stop_event.wait(interval_seconds):
+        now_stats = _read_network_iface_stats(iface_name)
+        if now_stats is None:
+            log.warning(f"[mesh-net] stat read failed for iface={iface_name}, skip this round")
+            continue
+
+        elapsed = max(time.time() - begin_time, 1e-6)
+        in_bytes = max(now_stats["rx_bytes"] - begin_stats["rx_bytes"], 0)
+        out_bytes = max(now_stats["tx_bytes"] - begin_stats["tx_bytes"], 0)
+        in_packets = max(now_stats["rx_packets"] - begin_stats["rx_packets"], 0)
+        out_packets = max(now_stats["tx_packets"] - begin_stats["tx_packets"], 0)
+
+        in_iops = in_packets / elapsed
+        out_iops = out_packets / elapsed
+        in_gb = in_bytes / 1_000_000_000
+        out_gb = out_bytes / 1_000_000_000
+        in_gb_s = in_gb / elapsed
+        out_gb_s = out_gb / elapsed
+
+        log.info(
+            f"[mesh-net] iface={iface_name} avg_in={in_iops:.1f} iops / {in_gb_s:.4f} GB/s (total {in_gb:.3f} GB), "
+            f"avg_out={out_iops:.1f} iops / {out_gb_s:.4f} GB/s (total {out_gb:.3f} GB)"
+        )
+
+    final_stats = _read_network_iface_stats(iface_name)
+    if final_stats is None:
+        log.info(f"[mesh-net] monitor stopped: iface={iface_name}")
+        return
+
+    elapsed = max(time.time() - begin_time, 1e-6)
+    in_bytes = max(final_stats["rx_bytes"] - begin_stats["rx_bytes"], 0)
+    out_bytes = max(final_stats["tx_bytes"] - begin_stats["tx_bytes"], 0)
+    in_packets = max(final_stats["rx_packets"] - begin_stats["rx_packets"], 0)
+    out_packets = max(final_stats["tx_packets"] - begin_stats["tx_packets"], 0)
+    in_iops = in_packets / elapsed
+    out_iops = out_packets / elapsed
+    in_gb = in_bytes / 1_000_000_000
+    out_gb = out_bytes / 1_000_000_000
+    in_gb_s = in_gb / elapsed
+    out_gb_s = out_gb / elapsed
+    log.info(
+        f"[mesh-net] monitor stopped: iface={iface_name}, "
+        f"avg_in={in_iops:.1f} iops / {in_gb_s:.4f} GB/s (total {in_gb:.3f} GB), "
+        f"avg_out={out_iops:.1f} iops / {out_gb_s:.4f} GB/s (total {out_gb:.3f} GB)"
+    )
 
 
 def _validate_socket_ifname(name: str, env_key: str) -> Tuple[bool, str]:
@@ -646,7 +780,10 @@ def _sync_missing_assets_from_main(
     ssh_password: str = "",
 ) -> Tuple[bool, str]:
     local_repo_root = base_dir_path()
-    config = toml.load(toml_path)
+    try:
+        config = toml.load(toml_path)
+    except Exception as e:
+        return False, f"读取本地训练配置失败: {toml_path} ({e})"
 
     for key in asset_keys:
         value = config.get(key)
@@ -715,51 +852,10 @@ def _ensure_main_distributed_autosave(toml_path: str, machine_rank: int, num_mac
 
 def _enforce_distributed_output_policy(toml_path: str, machine_rank: int) -> Tuple[bool, str]:
     repo_root = base_dir_path()
-    config = toml.load(toml_path)
-    changed = False
-
-    max_train_epochs = _to_int(config.get("max_train_epochs"), 1)
-    if max_train_epochs < 1:
-        max_train_epochs = 1
-
-    if machine_rank > 0:
-        # Worker node should not create checkpoints. Keep save interval beyond this run.
-        target_save_every = max_train_epochs + 1
-        if _to_int(config.get("save_every_n_epochs"), 1) != target_save_every:
-            old = config.get("save_every_n_epochs")
-            config["save_every_n_epochs"] = target_save_every
-            changed = True
-            log.info(
-                f"[output-policy] worker disable checkpoint save: "
-                f"save_every_n_epochs {old} -> {target_save_every}"
-            )
-
-        if _to_bool(config.get("save_state"), False):
-            config["save_state"] = False
-            changed = True
-            log.info("[output-policy] worker disable save_state: True -> False")
-
-        if "save_last_n_epochs_state" in config and _to_int(config.get("save_last_n_epochs_state"), 0) != 0:
-            old = config.get("save_last_n_epochs_state")
-            config["save_last_n_epochs_state"] = 0
-            changed = True
-            log.info(f"[output-policy] worker disable save_last_n_epochs_state: {old} -> 0")
-
-        if "sample_every_n_epochs" in config:
-            sample_every = _to_int(config.get("sample_every_n_epochs"), 0)
-            target_sample_every = max_train_epochs + 1
-            if sample_every > 0 and sample_every != target_sample_every:
-                config["sample_every_n_epochs"] = target_sample_every
-                changed = True
-                log.info(
-                    f"[output-policy] worker reduce preview outputs: "
-                    f"sample_every_n_epochs {sample_every} -> {target_sample_every}"
-                )
-
-    if changed:
-        with open(toml_path, "w", encoding="utf-8") as f:
-            f.write(toml.dumps(config))
-        log.info(f"[output-policy] wrote enforced policy to {toml_path}")
+    try:
+        config = toml.load(toml_path)
+    except Exception as e:
+        return False, f"读取训练配置失败: {toml_path} ({e})"
 
     if machine_rank > 0:
         output_dir = _resolve_local_path(str(config.get("output_dir", "./output")), repo_root)
@@ -767,6 +863,7 @@ def _enforce_distributed_output_policy(toml_path: str, machine_rank: int) -> Tup
         marker_path = output_dir / WORKER_OUTPUT_MARKER
         marker_path.touch(exist_ok=True)
         log.info(f"[output-policy] worker marker created: {marker_path}")
+        log.info("[output-policy] worker native save is enabled (no checkpoint/save_state override)")
 
     return True, ""
 
@@ -812,7 +909,8 @@ def run_train(toml_path: str,
     sync_config_keys_from_main = _parse_sync_config_keys(get_sync_value("sync_config_keys_from_main", None))
     sync_missing_assets_from_main = _to_bool(get_sync_value("sync_missing_assets_from_main", True), True)
     sync_asset_keys = _parse_csv(get_sync_value("sync_asset_keys", None), DEFAULT_SYNC_ASSET_KEYS)
-    sync_main_repo_dir = str(get_sync_value("sync_main_repo_dir", base_dir_path()) or base_dir_path())
+    detected_repo_root = os.getcwd()
+    sync_main_repo_dir = str(get_sync_value("sync_main_repo_dir", detected_repo_root) or detected_repo_root)
     sync_main_toml = str(
         get_sync_value("sync_main_toml", "./config/autosave/distributed-main-latest.toml")
         or "./config/autosave/distributed-main-latest.toml"
@@ -821,6 +919,12 @@ def run_train(toml_path: str,
     sync_ssh_port = int(get_sync_value("sync_ssh_port", 22) or 22)
     sync_use_password_auth = _to_bool(get_sync_value("sync_use_password_auth", True), True)
     clear_dataset_npz_before_train = _to_bool(distributed_config.get("clear_dataset_npz_before_train"), False)
+    mesh_net_monitor_interval_seconds = _to_int(
+        distributed_config.get("mesh_net_monitor_interval_seconds", MESH_NET_MONITOR_INTERVAL_SECONDS),
+        MESH_NET_MONITOR_INTERVAL_SECONDS,
+    )
+    if mesh_net_monitor_interval_seconds < 1:
+        mesh_net_monitor_interval_seconds = MESH_NET_MONITOR_INTERVAL_SECONDS
     sync_ssh_password = str(
         get_sync_value("sync_ssh_password", "") or os.environ.get("MIKAZUKI_SYNC_SSH_PASSWORD", "")
     ).strip()
@@ -870,6 +974,7 @@ def run_train(toml_path: str,
         return APIResponse(status="error", message=f"主机分布式 autosave 失败: {message}")
 
     is_worker = num_machines > 1 and machine_rank > 0
+    remote_host = ""
     if is_worker:
         remote_host = f"{sync_ssh_user}@{main_process_ip}" if sync_ssh_user else str(main_process_ip)
         if sync_use_password_auth and not sync_ssh_password:
@@ -926,9 +1031,12 @@ def run_train(toml_path: str,
     else:
         log.info("[cache-reset] skipped dataset npz cleanup (clear_dataset_npz_before_train=false)")
 
-    ok, message = _enforce_distributed_output_policy(toml_path=toml_path, machine_rank=machine_rank)
-    if not ok:
-        return APIResponse(status="error", message=f"输出策略应用失败: {message}")
+    if is_worker:
+        ok, message = _enforce_distributed_output_policy(toml_path=toml_path, machine_rank=machine_rank)
+        if not ok:
+            return APIResponse(status="error", message=f"输出策略应用失败: {message}")
+    else:
+        log.info("[output-policy] skipped (single-machine or main node)")
 
     if gpu_ids:
         customize_env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
@@ -958,9 +1066,36 @@ def run_train(toml_path: str,
     if not (task := tm.create_task(args, customize_env)):
         return APIResponse(status="error", message="Failed to create task / 无法创建训练任务")
 
+    mesh_iface = ""
+    if num_machines > 1:
+        mesh_iface = _pick_training_mesh_iface(nccl_socket_ifname, gloo_socket_ifname, str(main_process_ip or ""))
+        if mesh_iface:
+            log.info(
+                f"[mesh-net] enabled for distributed training: iface={mesh_iface}, "
+                f"interval={mesh_net_monitor_interval_seconds}s"
+            )
+        else:
+            log.warning("[mesh-net] distributed training detected but unable to resolve local training interface")
+
     def _run():
+        mesh_stop_event = None
+        mesh_thread = None
         try:
             task.execute()
+            if num_machines > 1 and mesh_iface:
+                mesh_stop_event = threading.Event()
+                mesh_thread = threading.Thread(
+                    target=_mesh_network_monitor_loop,
+                    args=(
+                        mesh_stop_event,
+                        mesh_iface,
+                        machine_rank,
+                        num_machines,
+                        mesh_net_monitor_interval_seconds,
+                    ),
+                    daemon=True,
+                )
+                mesh_thread.start()
             result = task.communicate()
             if result.returncode != 0:
                 log.error(f"Training failed / 训练失败")
@@ -968,6 +1103,11 @@ def run_train(toml_path: str,
                 log.info(f"Training finished / 训练完成")
         except Exception as e:
             log.error(f"An error occurred when training / 训练出现致命错误: {e}")
+        finally:
+            if mesh_stop_event is not None:
+                mesh_stop_event.set()
+            if mesh_thread is not None and mesh_thread.is_alive():
+                mesh_thread.join(timeout=2)
 
     coro = asyncio.to_thread(_run)
     asyncio.create_task(coro)
