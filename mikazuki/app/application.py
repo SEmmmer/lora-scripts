@@ -1,6 +1,7 @@
 import asyncio
 import mimetypes
 import os
+import socket
 import sys
 import webbrowser
 from contextlib import asynccontextmanager
@@ -254,6 +255,39 @@ class SPAStaticFiles(StaticFiles):
                 raise ex
 
 
+def _resolve_lan_ip() -> str | None:
+    # Prefer active outbound interface IPv4.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+
+    # Fallback to host-resolved IPv4 addresses.
+    try:
+        host = socket.gethostname()
+        for item in socket.getaddrinfo(host, None, family=socket.AF_INET):
+            ip = item[4][0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+
+    return None
+
+
+def _resolve_browser_host(host: str) -> str:
+    if host in ("0.0.0.0", "::", "[::]", "*", ""):
+        lan_ip = _resolve_lan_ip()
+        if lan_ip:
+            return lan_ip
+        return "127.0.0.1"
+    return host
+
+
 async def app_startup():
     app_config.load_config()
 
@@ -262,7 +296,9 @@ async def app_startup():
     await asyncio.to_thread(check_torch_gpu)
 
     if sys.platform == "win32" and os.environ.get("MIKAZUKI_DEV", "0") != "1":
-        webbrowser.open(f'http://{os.environ["MIKAZUKI_HOST"]}:{os.environ["MIKAZUKI_PORT"]}')
+        host = _resolve_browser_host(os.environ.get("MIKAZUKI_HOST", "127.0.0.1"))
+        port = os.environ.get("MIKAZUKI_PORT", "28000")
+        webbrowser.open(f"http://{host}:{port}")
 
 
 @asynccontextmanager

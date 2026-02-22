@@ -43,6 +43,11 @@ download_file() {
   exit 1
 }
 
+get_python_major_minor() {
+  local python_bin="$1"
+  "$python_bin" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+}
+
 install_uv() {
   if [[ -x "$UV_BIN" ]]; then
     return
@@ -128,8 +133,18 @@ install_embedded_python
 
 EMBEDDED_PYTHON_BIN="$(resolve_embedded_python_bin)"
 echo "Using embedded python: $EMBEDDED_PYTHON_BIN"
+EMBEDDED_PYTHON_RUNTIME_VERSION="$(get_python_major_minor "$EMBEDDED_PYTHON_BIN")"
+echo "Embedded python version: $EMBEDDED_PYTHON_RUNTIME_VERSION"
 
 if $create_venv; then
+  if [[ -x "$script_dir/venv/bin/python" ]]; then
+    VENV_PYTHON_VERSION="$(get_python_major_minor "$script_dir/venv/bin/python")"
+    if [[ "$VENV_PYTHON_VERSION" != "$EMBEDDED_PYTHON_RUNTIME_VERSION" ]]; then
+      echo "Existing venv python version $VENV_PYTHON_VERSION does not match embedded python $EMBEDDED_PYTHON_RUNTIME_VERSION. Recreating venv..."
+      rm -rf "$script_dir/venv"
+    fi
+  fi
+
   if [[ ! -x "$script_dir/venv/bin/python" ]]; then
     echo "Creating python venv from embedded python..."
     "$EMBEDDED_PYTHON_BIN" -m venv "$script_dir/venv"
@@ -138,6 +153,13 @@ if $create_venv; then
 else
   PYTHON_BIN="$EMBEDDED_PYTHON_BIN"
 fi
+
+ACTIVE_PYTHON_VERSION="$(get_python_major_minor "$PYTHON_BIN")"
+if [[ "$ACTIVE_PYTHON_VERSION" != "$EMBEDDED_PYTHON_RUNTIME_VERSION" ]]; then
+  echo "Active python version $ACTIVE_PYTHON_VERSION does not match embedded python version $EMBEDDED_PYTHON_RUNTIME_VERSION"
+  exit 1
+fi
+echo "Active python version: $ACTIVE_PYTHON_VERSION"
 
 echo "Installing torch & xformers..."
 cuda_version="$(nvidia-smi | grep -oiP 'CUDA Version: \K[\d\.]+' || true)"

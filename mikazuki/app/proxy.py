@@ -15,12 +15,20 @@ from mikazuki.log import log
 router = APIRouter()
 
 
+def _normalize_backend_host(host: str) -> str:
+    # Wildcard bind addresses are valid for servers, but not reliable
+    # client targets on Windows when reverse proxying to local services.
+    if host in ("0.0.0.0", "::", "[::]", "*", ""):
+        return "127.0.0.1"
+    return host
+
+
 def reverse_proxy_maker(url_type: str, full_path: bool = False):
     if url_type == "tensorboard":
-        host = os.environ.get("MIKAZUKI_TENSORBOARD_HOST", "127.0.0.1")
+        host = _normalize_backend_host(os.environ.get("MIKAZUKI_TENSORBOARD_HOST", "127.0.0.1"))
         port = os.environ.get("MIKAZUKI_TENSORBOARD_PORT", "6006")
     elif url_type == "tageditor":
-        host = os.environ.get("MIKAZUKI_TAGEDITOR_HOST", "127.0.0.1")
+        host = _normalize_backend_host(os.environ.get("MIKAZUKI_TAGEDITOR_HOST", "127.0.0.1"))
         port = os.environ.get("MIKAZUKI_TAGEDITOR_PORT", "28001")
 
     client = httpx.AsyncClient(base_url=f"http://{host}:{port}/", proxies={}, trust_env=False, timeout=360)

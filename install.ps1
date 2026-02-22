@@ -27,6 +27,17 @@ function Invoke-Pip {
     }
 }
 
+function Get-PythonMajorMinor {
+    param(
+        [string]$PythonBin
+    )
+    $versionOutput = & $PythonBin -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+    if ($LASTEXITCODE -ne 0 -or -not $versionOutput) {
+        throw "failed to query python version from $PythonBin"
+    }
+    return ($versionOutput | Select-Object -First 1).Trim()
+}
+
 function Install-Uv {
     if (Test-Path $UvExe) {
         return
@@ -122,22 +133,39 @@ try {
 
     $embeddedPythonBin = Resolve-EmbeddedPythonBin
     Write-Output "Using embedded python: $embeddedPythonBin"
+    $embeddedPythonRuntimeVersion = Get-PythonMajorMinor $embeddedPythonBin
+    Write-Output "Embedded python version: $embeddedPythonRuntimeVersion"
 
     if (-not $DisableVenv) {
-        if (-not (Test-Path ".\venv\Scripts\python.exe")) {
+        $venvPythonPath = ".\venv\Scripts\python.exe"
+        if (Test-Path $venvPythonPath) {
+            $venvPythonVersion = Get-PythonMajorMinor (Resolve-Path $venvPythonPath).Path
+            if ($venvPythonVersion -ne $embeddedPythonRuntimeVersion) {
+                Write-Output "Existing venv python version $venvPythonVersion does not match embedded python $embeddedPythonRuntimeVersion. Recreating venv..."
+                Remove-Item -Path ".\venv" -Recurse -Force
+            }
+        }
+
+        if (-not (Test-Path $venvPythonPath)) {
             Write-Output "Creating python venv from embedded python..."
             & $embeddedPythonBin -m venv venv
             if ($LASTEXITCODE -ne 0) {
                 throw "failed to create python virtual environment from embedded python"
             }
         }
-        $pythonBin = (Resolve-Path ".\venv\Scripts\python.exe").Path
+        $pythonBin = (Resolve-Path $venvPythonPath).Path
         Write-Output "Using venv python: $pythonBin"
     }
     else {
         $pythonBin = $embeddedPythonBin
         Write-Output "Using embedded python (venv disabled): $pythonBin"
     }
+
+    $activePythonVersion = Get-PythonMajorMinor $pythonBin
+    if ($activePythonVersion -ne $embeddedPythonRuntimeVersion) {
+        throw "active python version $activePythonVersion does not match embedded python version $embeddedPythonRuntimeVersion"
+    }
+    Write-Output "Active python version: $activePythonVersion"
 
     $cudaVersion = Get-CudaVersion
     if (-not $cudaVersion) {
