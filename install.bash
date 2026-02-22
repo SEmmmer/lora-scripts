@@ -1,4 +1,7 @@
 #!/usr/bin/bash
+set -e
+set -o pipefail
+trap 'echo "Install failed"; exit 1' ERR
 
 script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 create_venv=true
@@ -24,10 +27,10 @@ fi
 
 echo "Installing torch & xformers..."
 
-cuda_version=$(nvidia-smi | grep -oiP 'CUDA Version: \K[\d\.]+')
+cuda_version=$(nvidia-smi | grep -oiP 'CUDA Version: \K[\d\.]+' || true)
 
 if [ -z "$cuda_version" ]; then
-    cuda_version=$(nvcc --version | grep -oiP 'release \K[\d\.]+')
+    cuda_version=$(nvcc --version | grep -oiP 'release \K[\d\.]+' || true)
 fi
 cuda_major_version=$(echo "$cuda_version" | awk -F'.' '{print $1}')
 cuda_minor_version=$(echo "$cuda_version" | awk -F'.' '{print $2}')
@@ -36,9 +39,9 @@ echo "CUDA Version: $cuda_version"
 
 
 if (( cuda_major_version >= 12 )); then
-    echo "install torch 2.7.0+cu128"
-    pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
-    pip install --no-deps xformers==0.0.30 --extra-index-url https://download.pytorch.org/whl/cu128
+    echo "install torch 2.10.0+cu128"
+    pip install torch==2.10.0+cu128 torchvision==0.25.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
+    pip install --no-deps xformers==0.0.35 --extra-index-url https://download.pytorch.org/whl/cu128
 elif (( cuda_major_version == 11 && cuda_minor_version >= 8 )); then
     echo "install torch 2.4.0+cu118"
     pip install torch==2.4.0+cu118 torchvision==0.19.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118

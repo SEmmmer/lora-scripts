@@ -26,6 +26,9 @@ function Invoke-Pip {
         [string[]]$PipArgs
     )
     & $PythonBin -m pip @PipArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "pip command failed: python -m pip $($PipArgs -join ' ')"
+    }
 }
 
 function Get-CudaVersion {
@@ -48,58 +51,73 @@ function Get-CudaVersion {
     return $null
 }
 
-$pythonBin = Resolve-SystemPython
+try {
+    $pythonBin = Resolve-SystemPython
 
-if (-not $DisableVenv) {
-    if (-not (Test-Path ".\venv\Scripts\python.exe")) {
-        Write-Output "Creating python venv..."
-        & $pythonBin -m venv venv
+    if (-not $DisableVenv) {
+        if (-not (Test-Path ".\venv\Scripts\python.exe")) {
+            Write-Output "Creating python venv..."
+            & $pythonBin -m venv venv
+            if ($LASTEXITCODE -ne 0) {
+                throw "failed to create python virtual environment"
+            }
+        }
+        $pythonBin = (Resolve-Path ".\venv\Scripts\python.exe").Path
+        Write-Output "Using venv python: $pythonBin"
     }
-    $pythonBin = (Resolve-Path ".\venv\Scripts\python.exe").Path
-    Write-Output "Using venv python: $pythonBin"
-}
-else {
-    Write-Output "Using system python (venv disabled)."
-}
+    else {
+        Write-Output "Using system python (venv disabled)."
+    }
 
-$cudaVersion = Get-CudaVersion
-if (-not $cudaVersion) {
-    throw "Unable to detect CUDA version from nvidia-smi or nvcc."
-}
+    $cudaVersion = Get-CudaVersion
+    if (-not $cudaVersion) {
+        throw "Unable to detect CUDA version from nvidia-smi or nvcc."
+    }
 
-Write-Output "CUDA Version: $cudaVersion"
-$cuda = [version]$cudaVersion
+    Write-Output "CUDA Version: $cudaVersion"
+    $cuda = [version]$cudaVersion
 
-if ($cuda.Major -ge 12) {
-    Write-Output "Installing torch 2.7.0+cu128"
-    Invoke-Pip $pythonBin @("install", "torch==2.7.0+cu128", "torchvision==0.22.0+cu128", "--extra-index-url", "https://download.pytorch.org/whl/cu128")
-    Invoke-Pip $pythonBin @("install", "--no-deps", "xformers==0.0.30", "--extra-index-url", "https://download.pytorch.org/whl/cu128")
-}
-elseif ($cuda.Major -eq 11 -and $cuda.Minor -ge 8) {
-    Write-Output "Installing torch 2.4.0+cu118"
-    Invoke-Pip $pythonBin @("install", "torch==2.4.0+cu118", "torchvision==0.19.0+cu118", "--extra-index-url", "https://download.pytorch.org/whl/cu118")
-    Invoke-Pip $pythonBin @("install", "--no-deps", "xformers==0.0.27.post2+cu118", "--extra-index-url", "https://download.pytorch.org/whl/cu118")
-}
-elseif ($cuda.Major -eq 11 -and $cuda.Minor -ge 6) {
-    Write-Output "Installing torch 1.12.1+cu116"
-    Invoke-Pip $pythonBin @("install", "torch==1.12.1+cu116", "torchvision==0.13.1+cu116", "--extra-index-url", "https://download.pytorch.org/whl/cu116")
-    Invoke-Pip $pythonBin @("install", "--upgrade", "git+https://github.com/facebookresearch/xformers.git@0bad001ddd56c080524d37c84ff58d9cd030ebfd")
-    Invoke-Pip $pythonBin @("install", "triton==2.0.0.dev20221202")
-}
-elseif ($cuda.Major -eq 11 -and $cuda.Minor -ge 2) {
-    Write-Output "Installing torch 1.12.1+cu113"
-    Invoke-Pip $pythonBin @("install", "torch==1.12.1+cu113", "torchvision==0.13.1+cu113", "--extra-index-url", "https://download.pytorch.org/whl/cu116")
-    Invoke-Pip $pythonBin @("install", "--upgrade", "git+https://github.com/facebookresearch/xformers.git@0bad001ddd56c080524d37c84ff58d9cd030ebfd")
-    Invoke-Pip $pythonBin @("install", "triton==2.0.0.dev20221202")
-}
-else {
-    throw "Unsupported CUDA version: $cudaVersion"
-}
+    if ($cuda.Major -ge 12) {
+        Write-Output "Installing torch 2.10.0+cu128"
+        Invoke-Pip $pythonBin @("install", "torch==2.10.0+cu128", "torchvision==0.25.0+cu128", "--extra-index-url", "https://download.pytorch.org/whl/cu128")
+        Invoke-Pip $pythonBin @("install", "--no-deps", "xformers==0.0.35", "--extra-index-url", "https://download.pytorch.org/whl/cu128")
+    }
+    elseif ($cuda.Major -eq 11 -and $cuda.Minor -ge 8) {
+        Write-Output "Installing torch 2.4.0+cu118"
+        Invoke-Pip $pythonBin @("install", "torch==2.4.0+cu118", "torchvision==0.19.0+cu118", "--extra-index-url", "https://download.pytorch.org/whl/cu118")
+        Invoke-Pip $pythonBin @("install", "--no-deps", "xformers==0.0.27.post2+cu118", "--extra-index-url", "https://download.pytorch.org/whl/cu118")
+    }
+    elseif ($cuda.Major -eq 11 -and $cuda.Minor -ge 6) {
+        Write-Output "Installing torch 1.12.1+cu116"
+        Invoke-Pip $pythonBin @("install", "torch==1.12.1+cu116", "torchvision==0.13.1+cu116", "--extra-index-url", "https://download.pytorch.org/whl/cu116")
+        Invoke-Pip $pythonBin @("install", "--upgrade", "git+https://github.com/facebookresearch/xformers.git@0bad001ddd56c080524d37c84ff58d9cd030ebfd")
+        Invoke-Pip $pythonBin @("install", "triton==2.0.0.dev20221202")
+    }
+    elseif ($cuda.Major -eq 11 -and $cuda.Minor -ge 2) {
+        Write-Output "Installing torch 1.12.1+cu113"
+        Invoke-Pip $pythonBin @("install", "torch==1.12.1+cu113", "torchvision==0.13.1+cu113", "--extra-index-url", "https://download.pytorch.org/whl/cu116")
+        Invoke-Pip $pythonBin @("install", "--upgrade", "git+https://github.com/facebookresearch/xformers.git@0bad001ddd56c080524d37c84ff58d9cd030ebfd")
+        Invoke-Pip $pythonBin @("install", "triton==2.0.0.dev20221202")
+    }
+    else {
+        throw "Unsupported CUDA version: $cudaVersion"
+    }
 
-Write-Output "Installing deps..."
-Invoke-Pip $pythonBin @("install", "--upgrade", "-r", "requirements.txt")
+    Write-Output "Installing deps..."
+    Invoke-Pip $pythonBin @("install", "--upgrade", "-r", "requirements.txt")
 
-Write-Output "Install completed"
-if ([Environment]::UserInteractive) {
-    Read-Host | Out-Null
+    Write-Output "Install completed"
+}
+catch {
+    $message = $_.Exception.Message
+    if (-not $message) {
+        $message = "unknown error"
+    }
+    Write-Output "Install failed: $message"
+    exit 1
+}
+finally {
+    if ([Environment]::UserInteractive) {
+        Read-Host | Out-Null
+    }
 }
