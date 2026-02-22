@@ -81,7 +81,7 @@ Run `install.bash` will create a venv and install necessary deps.
 
 #### Train
 
-run `bash run_gui.sh`, then program will open [http://127.0.0.1:28000](http://127.0.0.1:28000) automanticlly
+run `bash run_gui.sh`, then open [http://127.0.0.1:28000](http://127.0.0.1:28000) in your browser
 
 ## Legacy training through run script manually
 

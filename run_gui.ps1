@@ -1,17 +1,63 @@
+$ErrorActionPreference = "Stop"
+
 $Env:HF_HOME = "huggingface"
 $Env:PYTHONUTF8 = "1"
 
-if (Test-Path -Path "venv\Scripts\activate") {
-    Write-Host -ForegroundColor green "Activating virtual environment..."
-    .\venv\Scripts\activate
-}
-elseif (Test-Path -Path "python\python.exe") {
-    Write-Host -ForegroundColor green "Using python from python folder..."
-    $py_path = (Get-Item "python").FullName
-    $env:PATH = "$py_path;$env:PATH"
-}
-else {
-    Write-Host -ForegroundColor Blue "No virtual environment found, using system python..."
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ScriptDir
+
+function Test-HelpRequest {
+    param([string[]]$CliArgs)
+    foreach ($arg in $CliArgs) {
+        if ($arg -eq "-h" -or $arg -eq "--help") {
+            return $true
+        }
+    }
+    return $false
 }
 
-python gui.py
+function Resolve-PythonBin {
+    if (Test-Path ".\venv\Scripts\python.exe") {
+        return (Resolve-Path ".\venv\Scripts\python.exe").Path
+    }
+    if (Test-Path ".\python\python.exe") {
+        return (Resolve-Path ".\python\python.exe").Path
+    }
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        return "python"
+    }
+    throw "python executable not found. Please install Python 3 first."
+}
+
+function Ensure-VenvOrInstall {
+    param([string[]]$CliArgs)
+
+    if (Test-Path ".\venv\Scripts\python.exe") {
+        return
+    }
+
+    if (Test-HelpRequest $CliArgs) {
+        return
+    }
+
+    Write-Host "Detected missing virtual environment: .\venv" -ForegroundColor Yellow
+
+    if (-not [Environment]::UserInteractive) {
+        throw "No interactive terminal detected. Run .\install.ps1 manually first."
+    }
+
+    $answer = Read-Host "venv is missing. Run install.ps1 now? [Y/n]"
+    if ($answer -and ($answer -notmatch "^(?i:y|yes)$")) {
+        throw "Installation cancelled."
+    }
+
+    & ".\install.ps1"
+
+    if (-not (Test-Path ".\venv\Scripts\python.exe")) {
+        throw "venv was not created successfully. Please check install.ps1 output."
+    }
+}
+
+Ensure-VenvOrInstall $args
+$pythonBin = Resolve-PythonBin
+& $pythonBin "gui.py" @args

@@ -12,13 +12,12 @@ from mikazuki.log import log
 parser = argparse.ArgumentParser(description="GUI for stable diffusion training")
 parser.add_argument("--host", type=str, default="0.0.0.0")
 parser.add_argument("--port", type=int, default=28000, help="Port to run the server on")
-parser.add_argument("--listen", action="store_true")
+parser.add_argument("--listen", action="store_true", help="Backward-compatible alias for --host 0.0.0.0")
 parser.add_argument("--skip-prepare-environment", action="store_true")
-parser.add_argument("--skip-prepare-onnxruntime", action="store_true")
 parser.add_argument("--disable-tensorboard", action="store_true")
 parser.add_argument("--disable-tageditor", action="store_true")
 parser.add_argument("--disable-auto-mirror", action="store_true")
-parser.add_argument("--tensorboard-host", type=str, default="0.0.0.0", help="Port to run the tensorboard")
+parser.add_argument("--tensorboard-host", type=str, default="0.0.0.0", help="Host to run the tensorboard on")
 parser.add_argument("--tensorboard-port", type=int, default=6006, help="Port to run the tensorboard")
 parser.add_argument("--localization", type=str)
 parser.add_argument("--dev", action="store_true")
@@ -79,14 +78,18 @@ def launch():
 
     if not check_port_avaliable(args.port):
         avaliable = find_avaliable_ports(30000, 30000+20)
-        if avaliable:
+        if avaliable is not None:
+            log.warning(f"Port {args.port} is unavailable, using fallback port {avaliable}.")
             args.port = avaliable
         else:
-            log.error("port finding fallback error")
+            log.error(f"Port {args.port} is unavailable and fallback search failed. Abort launch.")
+            sys.exit(1)
 
     log.info(f"SD-Trainer Version: {git_tag(base_dir_path())}")
 
     if args.listen:
+        if args.host != "0.0.0.0" or args.tensorboard_host != "0.0.0.0":
+            log.warning("--listen is set, force host and tensorboard-host to 0.0.0.0")
         args.host = "0.0.0.0"
         args.tensorboard_host = "0.0.0.0"
 

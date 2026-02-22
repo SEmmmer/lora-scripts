@@ -12,7 +12,6 @@ from typing import Tuple, Optional
 
 import toml
 from fastapi import APIRouter, BackgroundTasks, Request
-from starlette.requests import Request
 
 import mikazuki.process as process
 from mikazuki import launch_utils
@@ -35,6 +34,12 @@ avaliable_scripts = [
     "networks/extract_lora_from_dylora.py",
     "networks/merge_lora.py",
     "tools/merge_models.py",
+]
+cli_arg_key_pattern = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+script_search_roots = [
+    launch_utils.base_dir_path() / "scripts" / "stable",
+    launch_utils.base_dir_path() / "scripts" / "dev",
+    launch_utils.base_dir_path() / "scripts",
 ]
 
 avaliable_schemas = []
@@ -134,6 +139,18 @@ async def load_presets():
         with open(os.path.join(preset_dir, preset_name), encoding="utf-8") as f:
             content = f.read()
             avaliable_presets.append(toml.loads(content))
+
+
+def _resolve_available_script(script_name: str) -> Optional[Path]:
+    rel_path = Path(script_name.strip())
+    if rel_path.is_absolute() or ".." in rel_path.parts:
+        return None
+
+    for root in script_search_roots:
+        candidate = root / rel_path
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
 
 
 def get_sample_prompts(config: dict) -> Tuple[Optional[str], str]:
@@ -270,24 +287,61 @@ async def create_toml_file(request: Request):
 
 @router.post("/run_script")
 async def run_script(request: Request, background_tasks: BackgroundTasks):
-    paras = await request.body()
-    j = json.loads(paras.decode("utf-8"))
-    script_name = j["script_name"]
+    try:
+        payload = json.loads((await request.body()).decode("utf-8"))
+    except json.JSONDecodeError:
+        return APIResponseFail(message="Invalid JSON payload")
+    if not isinstance(payload, dict):
+        return APIResponseFail(message="Invalid payload type")
+
+    script_name = str(payload.get("script_name", "")).strip()
     if script_name not in avaliable_scripts:
         return APIResponseFail(message="Script not found")
-    del j["script_name"]
-    result = []
-    for k, v in j.items():
-        result.append(f"--{k}")
-        if not isinstance(v, bool):
-            value = str(v)
-            if " " in value:
-                value = f'"{v}"'
-            result.append(value)
-    script_args = " ".join(result)
-    script_path = Path(os.getcwd()) / "scripts" / script_name
-    cmd = f"{launch_utils.python_bin} {script_path} {script_args}"
-    background_tasks.add_task(launch_utils.run, cmd)
+
+    script_path = _resolve_available_script(script_name)
+    if script_path is None:
+        return APIResponseFail(message=f"Script not found on disk: {script_name}")
+
+    cmd = [launch_utils.python_bin, str(script_path)]
+    skipped_params = []
+    for k, v in payload.items():
+        if k == "script_name":
+            continue
+
+        key = str(k).strip()
+        if key == "":
+            continue
+        if not cli_arg_key_pattern.match(key):
+            skipped_params.append(key)
+            continue
+
+        if isinstance(v, bool):
+            if v:
+                cmd.append(f"--{key}")
+            continue
+
+        if v is None:
+            skipped_params.append(key)
+            continue
+
+        if isinstance(v, str):
+            value = v.strip()
+            if value == "":
+                skipped_params.append(key)
+                continue
+            cmd.extend([f"--{key}", value])
+            continue
+
+        if isinstance(v, (dict, list, tuple, set)):
+            skipped_params.append(key)
+            continue
+
+        cmd.extend([f"--{key}", str(v)])
+
+    if skipped_params:
+        log.warning(f"/run_script skipped invalid/empty params: {', '.join(skipped_params)}")
+
+    background_tasks.add_task(launch_utils.run, cmd, shell=False)
     return APIResponseSuccess()
 
 
@@ -328,6 +382,8 @@ async def pick_file(picker_type: str):
     elif picker_type == "model-file":
         file_types = [("checkpoints", "*.safetensors;*.ckpt;*.pt"), ("all files", "*.*")]
         coro = asyncio.to_thread(open_file_selector, "", "Select file", file_types)
+    else:
+        return APIResponseFail(message="Invalid picker type")
 
     result = await coro
     if result == "":

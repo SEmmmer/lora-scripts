@@ -70,8 +70,16 @@ class Task:
         self.process = subprocess.Popen(self.command, env=self.environ)
 
     def terminate(self):
+        if not hasattr(self, "process"):
+            self.status = TaskStatus.TERMINATED
+            return
+
+        if self.process.poll() is not None:
+            self.status = TaskStatus.TERMINATED
+            return
+
         try:
-            kill_proc_tree(self.process.pid, False)
+            kill_proc_tree(self.process.pid, True)
         except Exception as e:
             log.error(f"Error when killing process: {e}")
             return

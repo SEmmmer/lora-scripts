@@ -80,7 +80,7 @@ git clone --recurse-submodules https://github.com/Akegarasu/lora-scripts
 
 #### 训练
 
-运行 `bash run_gui.sh`，程序将自动打开 [http://127.0.0.1:28000](http://127.0.0.1:28000)
+运行 `bash run_gui.sh`，然后在浏览器访问 [http://127.0.0.1:28000](http://127.0.0.1:28000)
 
 ### Docker
 
@@ -175,14 +175,14 @@ source venv/bin/activate
 - Worker：`192.168.50.229`
 - 网卡：`enp11s0`
 
-仓库新增了 `train_2node.sh`，用于两台 Linux 机器一键启动分布式训练（`train.sh` / `train_by_toml.sh`）。
+通过环境变量直接启动 `train.sh` / `train_by_toml.sh`。
 
 同步修改到 worker（推荐流程）：
 
 ```sh
 # 主节点 192.168.50.219
-git add train.sh train_by_toml.sh train_2node.sh README-zh.md
-git commit -m "add 2-node distributed launcher for linux"
+git add train.sh train_by_toml.sh README-zh.md
+git commit -m "update 2-node distributed docs for direct env launch"
 git push
 ```
 
@@ -204,20 +204,29 @@ source venv/bin/activate
 在主节点启动（rank 0）：
 
 ```sh
-NUM_PROCESSES_PER_MACHINE=1 bash train_2node.sh main train
+NUM_MACHINES=2 MACHINE_RANK=0 MAIN_PROCESS_IP=192.168.50.219 MAIN_PROCESS_PORT=29500 \
+NCCL_SOCKET_IFNAME=enp11s0 GLOO_SOCKET_IFNAME=enp11s0 NUM_PROCESSES_PER_MACHINE=1 \
+bash train.sh
 ```
 
 在 worker 启动（rank 1）：
 
 ```sh
-NUM_PROCESSES_PER_MACHINE=1 bash train_2node.sh worker train
+NUM_MACHINES=2 MACHINE_RANK=1 MAIN_PROCESS_IP=192.168.50.219 MAIN_PROCESS_PORT=29500 \
+NCCL_SOCKET_IFNAME=enp11s0 GLOO_SOCKET_IFNAME=enp11s0 NUM_PROCESSES_PER_MACHINE=1 \
+bash train.sh
 ```
 
 如果你使用 TOML 配置训练，把 `train` 改成 `toml`：
 
 ```sh
-NUM_PROCESSES_PER_MACHINE=1 bash train_2node.sh main toml
-NUM_PROCESSES_PER_MACHINE=1 bash train_2node.sh worker toml
+NUM_MACHINES=2 MACHINE_RANK=0 MAIN_PROCESS_IP=192.168.50.219 MAIN_PROCESS_PORT=29500 \
+NCCL_SOCKET_IFNAME=enp11s0 GLOO_SOCKET_IFNAME=enp11s0 NUM_PROCESSES_PER_MACHINE=1 \
+bash train_by_toml.sh
+
+NUM_MACHINES=2 MACHINE_RANK=1 MAIN_PROCESS_IP=192.168.50.219 MAIN_PROCESS_PORT=29500 \
+NCCL_SOCKET_IFNAME=enp11s0 GLOO_SOCKET_IFNAME=enp11s0 NUM_PROCESSES_PER_MACHINE=1 \
+bash train_by_toml.sh
 ```
 
 注意：训练数据路径、底模路径、配置文件路径需要在两台机器保持一致（目录结构相同）。
