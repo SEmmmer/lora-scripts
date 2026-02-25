@@ -4799,13 +4799,46 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
 # region utils
 
 
+def _load_state_with_step_fallback(accelerator, state_dir: str):
+    try:
+        accelerator.load_state(state_dir)
+        return
+    except KeyError as e:
+        if e.args != ("step",):
+            raise
+
+    # accelerate<=0.33 may raise KeyError("step") when RNG state is missing/incomplete.
+    # model/optimizer/scheduler states are already loaded before that point, so continue safely.
+    recovered_step = None
+    train_state_file = os.path.join(state_dir, "train_state.json")
+    if os.path.isfile(train_state_file):
+        try:
+            with open(train_state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                step = data.get("current_step")
+                if isinstance(step, int):
+                    recovered_step = step
+        except Exception:
+            logger.warning(
+                f"failed to parse train_state.json while recovering step: {train_state_file}",
+                exc_info=True,
+            )
+
+    accelerator.step = recovered_step if recovered_step is not None else 0
+    logger.warning(
+        f"resume state is missing RNG step metadata, continue with accelerator.step={accelerator.step} "
+        + "(model/optimizer/scheduler states were loaded)"
+    )
+
+
 def resume_from_local_or_hf_if_specified(accelerator, args):
     if not args.resume:
         return
 
     if not args.resume_from_huggingface:
         logger.info(f"resume training from local state: {args.resume}")
-        accelerator.load_state(args.resume)
+        _load_state_with_step_fallback(accelerator, args.resume)
         return
 
     logger.info(f"resume training from huggingface state: {args.resume}")
@@ -4849,7 +4882,7 @@ def resume_from_local_or_hf_if_specified(accelerator, args):
             "No files found in the specified repo id/path/revision / 指定されたリポジトリID/パス/リビジョンにファイルが見つかりませんでした"
         )
     dirname = os.path.dirname(results[0])
-    accelerator.load_state(dirname)
+    _load_state_with_step_fallback(accelerator, dirname)
 
 
 def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
