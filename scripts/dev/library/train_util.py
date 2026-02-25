@@ -4799,9 +4799,36 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
 # region utils
 
 
+def _move_value_to_device(value, device):
+    if isinstance(value, dict):
+        return type(value)({k: _move_value_to_device(v, device) for k, v in value.items()})
+    if isinstance(value, list):
+        return [_move_value_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_value_to_device(v, device) for v in value)
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    return value
+
+
+def _move_optimizer_states_to_accelerator_device(accelerator):
+    device = getattr(accelerator, "device", None)
+    if device is None:
+        return
+
+    for optimizer in getattr(accelerator, "_optimizers", []):
+        try:
+            state_dict = optimizer.state_dict()
+            state_dict = _move_value_to_device(state_dict, device)
+            optimizer.load_state_dict(state_dict)
+        except Exception:
+            logger.warning("failed to move optimizer states to accelerator device after resume", exc_info=True)
+
+
 def _load_state_with_step_fallback(accelerator, state_dir: str):
     try:
         accelerator.load_state(state_dir)
+        _move_optimizer_states_to_accelerator_device(accelerator)
         return
     except KeyError as e:
         if e.args != ("step",):
@@ -4826,6 +4853,7 @@ def _load_state_with_step_fallback(accelerator, state_dir: str):
             )
 
     accelerator.step = recovered_step if recovered_step is not None else 0
+    _move_optimizer_states_to_accelerator_device(accelerator)
     logger.warning(
         f"resume state is missing RNG step metadata, continue with accelerator.step={accelerator.step} "
         + "(model/optimizer/scheduler states were loaded)"
