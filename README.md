@@ -149,4 +149,3 @@ Starts TensorBoard at `http://127.0.0.1:6006` by default.
 | `--tensorboard-host`          | str   | "0.0.0.0"     | Host to run TensorBoard                          |
 | `--tensorboard-port`          | int   | 6006          | Port to run TensorBoard                          |
 | `--localization`              | str   |               | Localization settings for the interface          |
-| `--dev`                       | bool  | false         | Developer mode to disable some checks            |

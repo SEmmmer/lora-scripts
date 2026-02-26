@@ -4,7 +4,7 @@ $ErrorActionPreference = "Stop"
 
 # Train data path
 $pretrained_model = "./sd-models/model.ckpt"
-$model_type = "sd1.5" # sd1.5 sd2.0 sdxl flux
+$model_type = "sd1.5" # sd1.5 sd2.0 sdxl
 $parameterization = 0
 
 $train_data_dir = "./train/aki"
@@ -108,9 +108,6 @@ elseif ($model_type -eq "sd2.0") {
 }
 elseif ($model_type -eq "sdxl") {
     $trainer_file = "./scripts/stable/sdxl_train_network.py"
-}
-elseif ($model_type -eq "flux") {
-    $trainer_file = "./scripts/dev/flux_train_network.py"
 }
 
 $total_num_processes = $num_processes_per_machine * $num_machines

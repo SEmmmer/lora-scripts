@@ -22,7 +22,6 @@ parser.add_argument("--disable-auto-mirror", action="store_true")
 parser.add_argument("--tensorboard-host", type=str, default="0.0.0.0", help="Host to run the tensorboard on")
 parser.add_argument("--tensorboard-port", type=int, default=6006, help="Port to run the tensorboard")
 parser.add_argument("--localization", type=str)
-parser.add_argument("--dev", action="store_true")
 
 
 def resolve_lan_ip() -> str | None:
@@ -144,7 +143,6 @@ def launch():
     os.environ["MIKAZUKI_PORT"] = str(args.port)
     os.environ["MIKAZUKI_TENSORBOARD_HOST"] = args.tensorboard_host
     os.environ["MIKAZUKI_TENSORBOARD_PORT"] = str(args.tensorboard_port)
-    os.environ["MIKAZUKI_DEV"] = "1" if args.dev else "0"
 
     if not args.disable_tageditor:
         run_tag_editor()
@@ -163,7 +161,7 @@ def launch():
         log.info("Any device on the same LAN can access this service.")
     else:
         log.info(f"Server started. Please visit: http://{args.host}:{args.port}")
-    uvicorn.run("mikazuki.app:app", host=args.host, port=args.port, log_level="error", reload=args.dev)
+    uvicorn.run("mikazuki.app:app", host=args.host, port=args.port, log_level="error", reload=False)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 
 # Train data path | 设置训练用模型、图片
 pretrained_model="./sd-models/model.ckpt" # base model path | 底模路径
-model_type="sd1.5"                        # option: sd1.5 sd2.0 sdxl flux | 可选 sd1.5 sd2.0 sdxl flux。SD2.0模型下 clip_skip 默认无效
+model_type="sd1.5"                        # option: sd1.5 sd2.0 sdxl | 可选 sd1.5 sd2.0 sdxl。SD2.0模型下 clip_skip 默认无效
 parameterization=0                        # parameterization | 参数化 本参数需要在 model_type 为 sd2.0 时才可启用
 
 train_data_dir="./train/aki" # train dataset path | 训练数据集路径
@@ -101,8 +101,6 @@ elif [ $model_type == "sd2.0" ]; then
   extArgs+=("--v2")
 elif [ $model_type == "sdxl" ]; then
   trainer_file="./scripts/stable/sdxl_train_network.py"
-elif [ $model_type == "flux" ]; then
-  trainer_file="./scripts/dev/flux_train_network.py"
 fi
 
 total_num_processes=$((num_processes_per_machine * num_machines))

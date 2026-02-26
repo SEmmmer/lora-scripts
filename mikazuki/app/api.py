@@ -38,7 +38,6 @@ avaliable_scripts = [
 cli_arg_key_pattern = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 script_search_roots = [
     launch_utils.base_dir_path() / "scripts" / "stable",
-    launch_utils.base_dir_path() / "scripts" / "dev",
     launch_utils.base_dir_path() / "scripts",
 ]
 
@@ -51,10 +50,6 @@ trainer_mapping = {
 
     "sd-dreambooth": "./scripts/stable/train_db.py",
     "sdxl-finetune": "./scripts/stable/sdxl_train.py",
-
-    "sd3-lora": "./scripts/dev/sd3_train_network.py",
-    "flux-lora": "./scripts/dev/flux_train_network.py",
-    "flux-finetune": "./scripts/dev/flux_train.py",
 }
 
 
@@ -242,7 +237,10 @@ async def create_toml_file(request: Request):
 
     suggest_cpu_threads = 8 if len(train_utils.get_total_images(config["train_data_dir"])) > 200 else 2
     model_train_type = config.pop("model_train_type", "sd-lora")
-    trainer_file = trainer_mapping[model_train_type]
+    trainer_file = trainer_mapping.get(model_train_type)
+    if trainer_file is None:
+        supported = ", ".join(sorted(trainer_mapping.keys()))
+        return APIResponseFail(message=f"不支持的训练类型: {model_train_type}。当前支持: {supported}")
 
     if model_train_type != "sdxl-finetune" and not skip_local_path_validation:
         if not train_utils.validate_data_dir(config["train_data_dir"]):

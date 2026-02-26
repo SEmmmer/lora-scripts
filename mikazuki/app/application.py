@@ -303,7 +303,7 @@ async def app_startup():
     await load_presets()
     await asyncio.to_thread(check_torch_gpu)
 
-    if sys.platform == "win32" and os.environ.get("MIKAZUKI_DEV", "0") != "1":
+    if sys.platform == "win32":
         host = _resolve_browser_host(os.environ.get("MIKAZUKI_HOST", "127.0.0.1"))
         port = os.environ.get("MIKAZUKI_PORT", "28000")
         webbrowser.open(f"http://{host}:{port}")
