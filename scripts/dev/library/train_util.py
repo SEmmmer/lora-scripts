@@ -777,8 +777,14 @@ class BaseDataset(torch.utils.data.Dataset):
     def set_current_epoch(self, epoch):
         if not self.current_epoch == epoch:  # epochが切り替わったらバケツをシャッフルする
             if epoch > self.current_epoch:
-                logger.info("epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
                 num_epochs = epoch - self.current_epoch
+                if self.current_epoch == 0 and num_epochs > 1:
+                    logger.info(
+                        "dataset epoch state is catching up for resume/worker init. target epoch: {} "
+                        "(local dataset epoch started from 0)".format(epoch)
+                    )
+                else:
+                    logger.info("epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
                 for _ in range(num_epochs):
                     self.current_epoch += 1
                     self.shuffle_buckets()

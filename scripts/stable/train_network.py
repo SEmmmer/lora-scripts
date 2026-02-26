@@ -843,7 +843,7 @@ class NetworkTrainer:
                 if state_epoch_to_start != step_based_epoch_to_start:
                     logger.warning(
                         "resume epoch mismatch detected: state epoch=%s, step-derived epoch=%s (step=%s, batches_per_epoch=%s). "
-                        "using state epoch to continue epoch numbering.",
+                        "this is expected when batch size/dataset length changed; using state epoch to continue epoch numbering.",
                         int(epoch_from_state),
                         step_based_epoch_to_start + 1 if step_based_epoch_to_start > 0 else 1,
                         resume_start_step,
