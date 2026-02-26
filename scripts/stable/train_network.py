@@ -50,6 +50,37 @@ class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
+        self._resume_active_training_time_sec = 0.0
+        self._run_started_at = None
+        self._tensorboard_walltime_base = None
+
+    def _get_effective_active_training_time_sec(self):
+        if self._run_started_at is None:
+            return float(self._resume_active_training_time_sec)
+        return float(self._resume_active_training_time_sec + max(0.0, time.time() - self._run_started_at))
+
+    def _get_tensorboard_walltime(self):
+        active_time = self._get_effective_active_training_time_sec()
+        if self._tensorboard_walltime_base is None:
+            started_at = self._run_started_at if self._run_started_at is not None else time.time()
+            self._tensorboard_walltime_base = started_at - active_time
+        return float(self._tensorboard_walltime_base + active_time)
+
+    def accelerator_logging(self, accelerator, logs, step_value):
+        tensorboard_tracker = None
+        other_trackers = []
+        for tracker in accelerator.trackers:
+            tracker_obj = accelerator.get_tracker(tracker.name)
+            if tracker.name == "tensorboard":
+                tensorboard_tracker = tracker_obj
+            else:
+                other_trackers.append(tracker_obj)
+
+        if tensorboard_tracker is not None:
+            tensorboard_tracker.log(logs, step=step_value, walltime=self._get_tensorboard_walltime())
+
+        for tracker in other_trackers:
+            tracker.log(logs, step=step_value)
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -517,6 +548,13 @@ class NetworkTrainer:
             # +1 is needed because the state is saved before current_step is set from global_step
             logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {current_step.value+1}")
             train_state = {"current_epoch": current_epoch.value, "current_step": current_step.value + 1}
+            active_training_time_sec = self._get_effective_active_training_time_sec()
+            train_state["active_training_time_sec"] = active_training_time_sec
+            train_state["tensorboard_walltime_base"] = (
+                self._tensorboard_walltime_base
+                if self._tensorboard_walltime_base is not None
+                else time.time() - active_training_time_sec
+            )
             resolved_logging_dir = getattr(args, "resolved_logging_dir", None) or getattr(accelerator, "project_dir", None)
             if resolved_logging_dir:
                 train_state["logging_dir"] = str(resolved_logging_dir)
@@ -525,6 +563,8 @@ class NetworkTrainer:
 
         steps_from_state = None
         epoch_from_state = None
+        active_time_from_state = None
+        tensorboard_walltime_base_from_state = None
 
         def load_model_hook(models, input_dir):
             # remove models except network
@@ -537,13 +577,15 @@ class NetworkTrainer:
             # print(f"load model hook: {len(models)} models will be loaded")
 
             # load current epoch and step to
-            nonlocal steps_from_state, epoch_from_state
+            nonlocal steps_from_state, epoch_from_state, active_time_from_state, tensorboard_walltime_base_from_state
             train_state_file = os.path.join(input_dir, "train_state.json")
             if os.path.exists(train_state_file):
                 with open(train_state_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 steps_from_state = data.get("current_step")
                 epoch_from_state = data.get("current_epoch")
+                active_time_from_state = data.get("active_training_time_sec")
+                tensorboard_walltime_base_from_state = data.get("tensorboard_walltime_base")
                 logger.info(f"load train state from {train_state_file}: {data}")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
@@ -551,6 +593,21 @@ class NetworkTrainer:
 
         # resumeする
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+        try:
+            self._resume_active_training_time_sec = max(0.0, float(active_time_from_state)) if active_time_from_state is not None else 0.0
+        except Exception:
+            logger.warning("failed to parse active_training_time_sec from resume state, fallback to 0", exc_info=True)
+            self._resume_active_training_time_sec = 0.0
+        self._run_started_at = time.time()
+        try:
+            self._tensorboard_walltime_base = (
+                float(tensorboard_walltime_base_from_state)
+                if tensorboard_walltime_base_from_state is not None
+                else self._run_started_at - self._resume_active_training_time_sec
+            )
+        except Exception:
+            logger.warning("failed to parse tensorboard_walltime_base from resume state, fallback to synthetic base", exc_info=True)
+            self._tensorboard_walltime_base = self._run_started_at - self._resume_active_training_time_sec
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1106,14 +1163,14 @@ class NetworkTrainer:
                     logs = self.generate_step_logs(
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions, keys_scaled, mean_norm, maximum_norm
                     )
-                    accelerator.log(logs, step=global_step)
+                    self.accelerator_logging(accelerator, logs, step_value=global_step)
 
                 if global_step >= args.max_train_steps:
                     break
 
             if args.logging_dir is not None:
                 logs = {"loss/epoch": loss_recorder.moving_average}
-                accelerator.log(logs, step=epoch + 1)
+                self.accelerator_logging(accelerator, logs, step_value=epoch + 1)
 
             accelerator.wait_for_everyone()
 
