@@ -265,12 +265,19 @@ def _build_mixed_resolution_plan(
         save_every_n_epochs = 1
 
     preview_enabled = _to_bool(config.get("enable_preview", False), False)
+    sample_prompts = str(config.get("sample_prompts", "") or "").strip()
+
+    raw_sample_every_n_epochs = config.get("sample_every_n_epochs", None)
+    base_sample_every_n_epochs = None
     try:
-        base_sample_every_n_epochs = int(config.get("sample_every_n_epochs", 1) or 1)
+        if raw_sample_every_n_epochs is not None and str(raw_sample_every_n_epochs).strip() != "":
+            parsed_sample_every_n_epochs = int(raw_sample_every_n_epochs)
+            if parsed_sample_every_n_epochs > 0:
+                base_sample_every_n_epochs = parsed_sample_every_n_epochs
     except Exception:
-        base_sample_every_n_epochs = 1
-    if base_sample_every_n_epochs <= 0:
-        base_sample_every_n_epochs = 1
+        base_sample_every_n_epochs = None
+
+    use_sample_epoch_schedule = bool(sample_prompts and base_sample_every_n_epochs is not None)
 
     configured_phases, ratio_error = _load_staged_phase_ratios(config)
     if ratio_error:
@@ -294,9 +301,11 @@ def _build_mixed_resolution_plan(
 
         sample_factor = float(MIXED_RESOLUTION_SAMPLE_EPOCH_FACTORS.get(side, base_pixels / target_pixels))
         save_every_n_epochs_this_phase = _scale_epoch_interval(save_every_n_epochs, sample_factor)
-        sample_every_n_epochs_this_phase = _scale_epoch_interval(base_sample_every_n_epochs, sample_factor)
+        sample_every_n_epochs_this_phase = (
+            _scale_epoch_interval(base_sample_every_n_epochs, sample_factor) if use_sample_epoch_schedule else None
+        )
         epoch_rounding_multiple = int(save_every_n_epochs_this_phase)
-        if preview_enabled:
+        if use_sample_epoch_schedule and sample_every_n_epochs_this_phase is not None:
             epoch_rounding_multiple = _lcm(epoch_rounding_multiple, sample_every_n_epochs_this_phase)
 
         # Raw formula: ceil(base_epochs * phase_ratio * (phase_batch / base_batch))
@@ -319,8 +328,10 @@ def _build_mixed_resolution_plan(
         phase_config.pop("resume_epoch_offset", None)
         phase_config["save_state"] = True
         phase_config["save_every_n_epochs"] = int(save_every_n_epochs_this_phase)
-        if preview_enabled:
+        if use_sample_epoch_schedule and sample_every_n_epochs_this_phase is not None:
             phase_config["sample_every_n_epochs"] = int(sample_every_n_epochs_this_phase)
+        else:
+            phase_config.pop("sample_every_n_epochs", None)
         if idx > 1:
             phase_config["resume"] = MIXED_RESOLUTION_RESUME_SENTINEL
 
@@ -330,7 +341,7 @@ def _build_mixed_resolution_plan(
         raw_formula = (
             f"ceil({base_epochs} * ({ratio_percent:g} / 100) * ({batch_this_phase} / {base_batch}))"
         )
-        if preview_enabled:
+        if use_sample_epoch_schedule and sample_every_n_epochs_this_phase is not None:
             actual_formula = (
                 "ceil_to_multiple(raw_epochs, "
                 f"lcm(save_every_n_epochs={save_every_n_epochs_this_phase}, "
@@ -362,7 +373,7 @@ def _build_mixed_resolution_plan(
                 "save_every_n_epochs_factor": float(sample_factor),
                 "save_every_n_epochs": int(save_every_n_epochs_this_phase),
                 "sample_every_n_epochs_factor": float(sample_factor),
-                "sample_every_n_epochs": int(sample_every_n_epochs_this_phase),
+                "sample_every_n_epochs": int(sample_every_n_epochs_this_phase) if sample_every_n_epochs_this_phase is not None else None,
                 "epoch_rounding_multiple": int(epoch_rounding_multiple),
                 "clear_cache_before_start": previous_side is not None and previous_side != side,
             }
@@ -380,7 +391,8 @@ def _build_mixed_resolution_plan(
             str(side): float(percent) for side, _, percent in configured_phases
         },
         "preview_enabled": bool(preview_enabled),
-        "base_sample_every_n_epochs": int(base_sample_every_n_epochs),
+        "use_sample_epoch_schedule": bool(use_sample_epoch_schedule),
+        "base_sample_every_n_epochs": int(base_sample_every_n_epochs) if base_sample_every_n_epochs is not None else None,
         "sample_every_n_epochs_rule": "1024=x, 768=ceil(1.78x), 512=ceil(4x)",
         "save_every_n_epochs_rule": "1024=x, 768=ceil(1.78x), 512=ceil(4x)",
         "base_resolution": f"{base_side},{base_side}",
@@ -1654,6 +1666,7 @@ def run_train(toml_path: str,
                 f"ratio_sum_percent={mixed_resolution_plan.get('configured_ratio_sum_percent')}, "
                 f"base_save_every_n_epochs={mixed_resolution_plan.get('save_every_n_epochs')}, "
                 f"preview_enabled={'yes' if mixed_resolution_plan.get('preview_enabled') else 'no'}, "
+                f"sample_schedule_enabled={'yes' if mixed_resolution_plan.get('use_sample_epoch_schedule') else 'no'}, "
                 f"base_sample_every_n_epochs={mixed_resolution_plan.get('base_sample_every_n_epochs')}, "
                 f"total_epochs={mixed_resolution_plan['total_mixed_epochs']}, "
                 f"total_steps={mixed_resolution_plan['total_mixed_steps']}"

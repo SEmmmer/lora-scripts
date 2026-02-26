@@ -848,6 +848,295 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
 })();
 </script>
 """
+
+_HIDE_DEPRECATED_LORA_DOCS_INJECTION = """
+<script id="mikazuki-hide-deprecated-lora-docs">
+(function () {
+  if (window.__MIKAZUKI_HIDE_DEPRECATED_LORA_DOCS__) return;
+  window.__MIKAZUKI_HIDE_DEPRECATED_LORA_DOCS__ = true;
+
+  var BLOCKED_PATH_RE = /^\\/lora\\/(basic|flux|sd3|tools|params)(?:\\.(?:html|md))?\\/?$/i;
+  var BLOCKED_LINK_RE = /\\/lora\\/(basic|flux|sd3|tools|params)\\.md$/i;
+  var BLOCKED_LABEL_RE = /^(新手（SD1\\.5）|Flux|SD3\\.5|工具|参数详解)$/i;
+  var REDIRECT_TO = "/lora/master.html";
+
+  function maybeRedirectBlockedPage() {
+    var pathname = (window.location && window.location.pathname) ? window.location.pathname : "";
+    if (!BLOCKED_PATH_RE.test(pathname)) return false;
+    if (pathname !== REDIRECT_TO) {
+      window.location.replace(REDIRECT_TO);
+    }
+    return true;
+  }
+
+  function removeBlockedSidebarEntries(root) {
+    var scope = root || document;
+    var links = scope.querySelectorAll("a.sidebar-item");
+    for (var i = 0; i < links.length; i++) {
+      var a = links[i];
+      var href = (a.getAttribute("href") || "").trim();
+      var label = (a.textContent || "").trim();
+      if (!BLOCKED_LINK_RE.test(href) && !BLOCKED_LABEL_RE.test(label)) continue;
+      var li = a.closest("li");
+      if (li && li.parentNode) {
+        li.parentNode.removeChild(li);
+      }
+    }
+  }
+
+  function cleanupEmptySidebarChildren() {
+    var groups = document.querySelectorAll("ul.sidebar-item-children");
+    for (var i = 0; i < groups.length; i++) {
+      var ul = groups[i];
+      if (ul.querySelector("li")) continue;
+      var parentLi = ul.closest("li");
+      if (parentLi && parentLi.parentNode) {
+        parentLi.parentNode.removeChild(parentLi);
+      }
+    }
+  }
+
+  function tick() {
+    if (maybeRedirectBlockedPage()) return;
+    removeBlockedSidebarEntries(document);
+    cleanupEmptySidebarChildren();
+  }
+
+  if (!maybeRedirectBlockedPage()) {
+    tick();
+    var observer = new MutationObserver(function () { tick(); });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    window.addEventListener("load", tick);
+    setInterval(tick, 400);
+  }
+})();
+</script>
+"""
+
+_TENSORBOARD_RUNS_DEFAULT_INJECTION = """
+<script id="mikazuki-tensorboard-runs-default">
+(function () {
+  if (window.__MIKAZUKI_TENSORBOARD_RUNS_DEFAULT__) return;
+  window.__MIKAZUKI_TENSORBOARD_RUNS_DEFAULT__ = true;
+
+  var TB_PATH_RE = /tensorboard/i;
+  var EXCLUDE_LABEL_RE = /^(all|none)$/i;
+  var NOISE_LABEL_RE = /(smoothing|ignore outliers|download|tooltip|x-axis|relative|filter|regex|paging|status|sort|direction|ascending|descending|settings|dark mode|light mode|select all|deselect all)/i;
+  var DATE_RE = /(20\\d{2})[-_/](\\d{2})[-_/](\\d{2})(?:[ T_:-]?(\\d{2})[:_-]?(\\d{2})[:_-]?(\\d{2}))?/;
+  var SUFFIX_RE = /_(\\d{1,6})(?!.*_\\d)/;
+
+  function isTensorboardWrapperPath() {
+    var path = (window.location && window.location.pathname) ? String(window.location.pathname) : "";
+    return TB_PATH_RE.test(path);
+  }
+
+  function getTensorboardIframe() {
+    var iframes = document.querySelectorAll("iframe");
+    if (!iframes || iframes.length === 0) return null;
+    for (var i = 0; i < iframes.length; i++) {
+      var f = iframes[i];
+      var src = String(f.getAttribute("src") || "");
+      if (/tensorboard|6006|\\/proxy\\/tensorboard/i.test(src)) return f;
+    }
+    return iframes.length === 1 ? iframes[0] : null;
+  }
+
+  function parseRunOrderScore(label) {
+    if (!label) return Number.NEGATIVE_INFINITY;
+    var m = label.match(DATE_RE);
+    if (!m) return Number.NEGATIVE_INFINITY;
+    var year = parseInt(m[1], 10);
+    var month = parseInt(m[2], 10) - 1;
+    var day = parseInt(m[3], 10);
+    var hh = parseInt(m[4] || "0", 10);
+    var mm = parseInt(m[5] || "0", 10);
+    var ss = parseInt(m[6] || "0", 10);
+    var base = Date.UTC(year, month, day, hh, mm, ss);
+    if (!Number.isFinite(base)) return Number.NEGATIVE_INFINITY;
+    var suffix = 0;
+    var s = label.match(SUFFIX_RE);
+    if (s) {
+      var parsed = parseInt(s[1], 10);
+      suffix = Number.isFinite(parsed) ? parsed : 0;
+    }
+    // Keep date as primary key and "_n" as tie-breaker.
+    return base * 1000000 + suffix;
+  }
+
+  function normalizeLabel(text) {
+    return String(text || "").replace(/\\s+/g, " ").trim();
+  }
+
+  function getRunCandidates(doc) {
+    var inputs = doc.querySelectorAll("input[type='checkbox']");
+    var candidates = [];
+    var seen = new Set();
+
+    for (var i = 0; i < inputs.length; i++) {
+      var input = inputs[i];
+      if (!input || seen.has(input)) continue;
+      seen.add(input);
+
+      var row =
+        input.closest("mat-checkbox") ||
+        input.closest("paper-checkbox") ||
+        input.closest("[role='treeitem']") ||
+        input.closest("li") ||
+        input.closest("tr") ||
+        input.closest("div");
+      if (!row) continue;
+
+      var label = normalizeLabel(row.textContent || "");
+      if (!label) continue;
+      if (EXCLUDE_LABEL_RE.test(label)) continue;
+      if (NOISE_LABEL_RE.test(label)) continue;
+      if (!DATE_RE.test(label)) continue;
+
+      candidates.push({
+        checkbox: input,
+        row: row,
+        label: label,
+        score: parseRunOrderScore(label),
+      });
+    }
+    return candidates;
+  }
+
+  function chooseMainGroup(candidates) {
+    var groups = new Map();
+    for (var i = 0; i < candidates.length; i++) {
+      var row = candidates[i].row;
+      var parent = row && row.parentElement ? row.parentElement : null;
+      if (!parent) continue;
+      var count = groups.get(parent) || 0;
+      groups.set(parent, count + 1);
+    }
+    var bestParent = null;
+    var bestCount = 0;
+    groups.forEach(function (count, parent) {
+      if (count > bestCount) {
+        bestCount = count;
+        bestParent = parent;
+      }
+    });
+    if (!bestParent || bestCount <= 0) return [];
+    return candidates.filter(function (c) {
+      return c.row && c.row.parentElement === bestParent;
+    });
+  }
+
+  function setCheckboxChecked(input, wanted) {
+    if (!input || input.disabled) return;
+    if (!!input.checked === !!wanted) return;
+    var clickable =
+      input.closest("mat-checkbox") ||
+      input.closest("paper-checkbox") ||
+      input.closest("label") ||
+      input;
+    if (clickable && typeof clickable.click === "function") {
+      clickable.click();
+      return;
+    }
+    input.checked = !!wanted;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function applyToIframeDocument(iframe) {
+    var win = null;
+    var doc = null;
+    try {
+      win = iframe.contentWindow || null;
+      doc = iframe.contentDocument || (win ? win.document : null);
+    } catch (_e) {
+      return false;
+    }
+    if (!doc || !doc.documentElement) return false;
+
+    if (win && win.__MIKAZUKI_TENSORBOARD_RUNS_APPLIED__) return true;
+
+    var candidates = getRunCandidates(doc);
+    if (!candidates || candidates.length === 0) return false;
+    var mainGroup = chooseMainGroup(candidates);
+    if (!mainGroup || mainGroup.length === 0) mainGroup = candidates;
+
+    mainGroup.sort(function (a, b) {
+      if (a.score !== b.score) return b.score - a.score;
+      return String(b.label).localeCompare(String(a.label));
+    });
+
+    // Reorder to newest -> oldest when rows share the same parent.
+    var canReorder = mainGroup.length > 1;
+    if (canReorder) {
+      var parent = mainGroup[0].row ? mainGroup[0].row.parentElement : null;
+      for (var i = 1; i < mainGroup.length; i++) {
+        if (!mainGroup[i].row || mainGroup[i].row.parentElement !== parent) {
+          canReorder = false;
+          break;
+        }
+      }
+      if (canReorder && parent) {
+        for (var j = 0; j < mainGroup.length; j++) {
+          parent.appendChild(mainGroup[j].row);
+        }
+      }
+    }
+
+    // Default visibility: only latest run checked.
+    var latest = mainGroup[0];
+    for (var k = 0; k < mainGroup.length; k++) {
+      setCheckboxChecked(mainGroup[k].checkbox, mainGroup[k] === latest);
+    }
+
+    if (win) {
+      win.__MIKAZUKI_TENSORBOARD_RUNS_APPLIED__ = true;
+    }
+    return true;
+  }
+
+  function bindTensorboardIframe(iframe) {
+    if (!iframe || iframe.__mikazukiRunsDefaultBound) return;
+    iframe.__mikazukiRunsDefaultBound = true;
+
+    var tries = 0;
+    var maxTries = 180;
+    var timer = null;
+
+    function tryApply() {
+      tries += 1;
+      var done = applyToIframeDocument(iframe);
+      if (done || tries >= maxTries) {
+        if (timer) {
+          clearInterval(timer);
+          timer = null;
+        }
+      }
+    }
+
+    iframe.addEventListener("load", function () {
+      tries = 0;
+      setTimeout(tryApply, 250);
+      setTimeout(tryApply, 1200);
+    });
+
+    timer = setInterval(tryApply, 800);
+    setTimeout(tryApply, 300);
+  }
+
+  function bootstrap() {
+    if (!isTensorboardWrapperPath()) return;
+    var iframe = getTensorboardIframe();
+    if (iframe) bindTensorboardIframe(iframe);
+  }
+
+  var observer = new MutationObserver(function () { bootstrap(); });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  window.addEventListener("load", bootstrap);
+  setTimeout(bootstrap, 0);
+  setInterval(bootstrap, 1500);
+})();
+</script>
+"""
 _patched_frontend_html_cache: dict[str, tuple[int, str]] = {}
 
 
@@ -879,6 +1168,34 @@ def _inject_staged_resolution_preview(html_content: str) -> str:
     if "</body>" in html_content:
         return html_content.replace("</body>", _STAGED_RESOLUTION_PREVIEW_INJECTION + "\n</body>", 1)
     return html_content + _STAGED_RESOLUTION_PREVIEW_INJECTION
+
+
+def _inject_hide_deprecated_lora_docs(html_content: str) -> str:
+    if 'id="mikazuki-hide-deprecated-lora-docs"' in html_content:
+        return html_content
+
+    module_tag = '<script type="module"'
+    if module_tag in html_content:
+        return html_content.replace(module_tag, _HIDE_DEPRECATED_LORA_DOCS_INJECTION + "\n" + module_tag, 1)
+
+    if "</head>" in html_content:
+        return html_content.replace("</head>", _HIDE_DEPRECATED_LORA_DOCS_INJECTION + "\n</head>", 1)
+
+    return _HIDE_DEPRECATED_LORA_DOCS_INJECTION + "\n" + html_content
+
+
+def _inject_tensorboard_runs_default(html_content: str) -> str:
+    if 'id="mikazuki-tensorboard-runs-default"' in html_content:
+        return html_content
+
+    module_tag = '<script type="module"'
+    if module_tag in html_content:
+        return html_content.replace(module_tag, _TENSORBOARD_RUNS_DEFAULT_INJECTION + "\n" + module_tag, 1)
+
+    if "</head>" in html_content:
+        return html_content.replace("</head>", _TENSORBOARD_RUNS_DEFAULT_INJECTION + "\n</head>", 1)
+
+    return _TENSORBOARD_RUNS_DEFAULT_INJECTION + "\n" + html_content
 
 
 def _resolve_frontend_html_file(request_path: str) -> Path | None:
@@ -928,6 +1245,8 @@ def _get_patched_frontend_html_content(request_path: str) -> str | None:
         return None
 
     content = _inject_schema_bootstrap(content)
+    content = _inject_hide_deprecated_lora_docs(content)
+    content = _inject_tensorboard_runs_default(content)
     content = _inject_worker_mode_guard(content)
     content = _inject_staged_resolution_preview(content)
     _patched_frontend_html_cache[cache_key] = (mtime_ns, content)
