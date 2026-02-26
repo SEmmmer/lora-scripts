@@ -1,196 +1,118 @@
-
 # SD-Trainer
-LoRA-scripts (a.k.a SD-Trainer)
 
-LoRA & Dreambooth training GUI & scripts preset & one-key training environment for [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts.git).
+SD-Trainer（LoRA-scripts）是一个面向 Stable Diffusion 训练的图形化工具集，提供 LoRA / DreamBooth 训练、环境安装、分布式协同与训练诊断能力。
 
-## Recent Updates / 更新说明
+本项目基于 `kohya-ss/sd-scripts` 训练生态，重点提供更稳定的工程化训练流程与易用的 GUI 体验。
 
-### 1) Resume 流程修复（可从中断步数继续）
+## 项目定位
 
-- Resume now restores model/optimizer/scheduler/dataloader/random states from `*-state` folders correctly.
-- To continue from an interrupted run (for example continue from `6/1800`), set `resume` to a state directory like:
-  - `./output/<your_output_name>/<your_output_name>-000070-state`
-- The state directory must contain `train_state.json`.
-- `network_weights` only loads LoRA weights and starts a new schedule. It is not equal to full state resume.
+- 日常训练：安装、启动、训练、resume
+- 多机：主从机协同、状态续接、网络与兼容性检查。
+- 建议使用 Ampere 架构及以上，Torch 2.10 以及 Cuda 12.8 以上版本。
 
-Recommended resume usage:
+## 近期功能整合（重点）
 
-1. Keep `train_data_dir`, `resolution`, `train_batch_size`, and `gradient_accumulation_steps` the same as the original run.
-2. Set `resume` to the desired `*-state` directory.
-3. Start training; progress should continue from recorded step/epoch.
+### 1. Resume 流程强化
 
-### 2) 阶段分辨率训练（Staged Resolution Training）
+- resume 可以稳定从 `*-state` 目录恢复模型、优化器、调度器、dataloader 与随机状态。
+- 阶段分辨率训练下，resume 会基于 `plan_id + step` 判断应该从哪个阶段继续，避免串阶段或错位恢复。
+- resume 后的训练进度显示更一致，降低 steps/epochs 混乱。
 
-- Added staged resolution training mode (512 -> 768 -> 1024).
-- Base training resolution is fixed to `1024,1024` in this mode.
-- The trainer auto-calculates phase batch size and equivalent epochs from the 1024-base setting.
-- Target is equivalent pixel-level training budget (total compute budget stays close), while often improving detail consolidation.
-- Phase ratios are configurable (0% to 100% each, sum <= 100%).
+使用建议：
 
-Core formula:
+- resume 时保持核心训练参数一致（数据集、分辨率、batch、梯度累加等）。
+- 仅填写 `network_weights` 属于“加载权重重新开训”，不等同于 resume。
 
-- `phase_batch = floor(base_batch * (1024*1024)/(phase_res*phase_res))`
-- `raw_phase_epoch = ceil(base_epoch * phase_ratio * (phase_batch/base_batch))`
-- `actual_phase_epoch = ceil_to_multiple(raw_phase_epoch, phase_save/sample alignment rule)`
+### 2. 阶段分辨率训练（512 -> 768 -> 1024）
 
-### 3) TensorBoard 记录优化
+- 启用后以 `1024,1024` 作为基准分辨率自动拆分为三阶段训练。
+- 支持 512/768/1024 占比自定义（0%~100%，总和不大于 100%）。
+- 自动计算每阶段 batch、epoch、steps、保存频率与采样频率，并在 GUI 中实时预览。
+- 切换阶段时会按需要重建缓存。
 
-- Run naming is improved for readability: `YYYY-MM-DD + model + _n`.
-- Resume training merges into the same TensorBoard run.
-- Runs that produce no checkpoint are removed from records.
-- Logging continuity is improved for resumed training scenarios.
+### 3. 梯度累加语义与等效 batch 统一
 
-### 4) Torch 2.10 + Blackwell 显卡建议
+当前规则：
 
-- For Torch 2.10 on Blackwell GPUs, this repo prefers SDPA path and avoids xformers path.
-- This reduces VRAM usage and improves stability on new architecture cards.
-- Verified practical batch size guidance on RTX 5090:
-  - Linux: up to batch size `24` (typical)
-  - Windows: recommend `22` for stability margin
+- 当 `gradient_accumulation_steps = 1`：三阶段都保持 1。
+- 当 `gradient_accumulation_steps > 1`：三阶段都保持与 1024 基准一致。
 
 
-## Usage
+### 4. 采样与保存频率联动优化
 
-### Required Dependencies
+- 阶段分辨率下，ckpt 与 sample 频率按以下规则缩放：
+  - `1024 = x`
+  - `768 = ceil(1.78x)`
+  - `512 = ceil(4x)`
+- 频率会纳入阶段 epochs 取整逻辑，降低“该保存却没保存”的风险。
 
-- Git
-- NVIDIA driver and CUDA-capable GPU
-- Internet access for dependency download
-- `iperf3` (optional but recommended for mesh bandwidth checks in cluster compatibility test)
+### 5. Sample 稳定性与显存清理增强
 
-> Python installation is not required manually. Installer uses embedded Python 3.10 and creates `venv`.
+- sample 流程增加了更完整的资源回收和异常保护。
+- sample OOM 时跳过当前 sample 并继续训练，而不是中断训练。
+- 在阶段/轮次边界避免多余 sample 触发，减少无效显存抖动。
 
+### 6. TensorBoard 体验优化
 
-## ✨ SD-Trainer GUI
+- 训练记录命名更可读，便于区分同模型多次训练。
+- resume 会尽量接入同一条训练记录，提升曲线连续性。
+- 无 ckpt 的记录会被清理。
 
-### Windows
+### 7. GUI 交互增强
 
-#### Installation
+- 在 GUI 页面按 `Ctrl+S` 会触发“保存参数”，不再是浏览器保存网页。
+- 新增“一键检测 Batch Size”按钮：按当前配置做真实短跑探测，给出推荐 batch。
 
-Run `install.ps1` to install embedded Python + create `venv` + install dependencies.
+## 环境与安装
 
-If you are in mainland China, use `install-cn.ps1`.
+### 依赖要求
 
-#### Start GUI
+- NVIDIA Ampere 及以上架构 GPU 与 CUDA 12.8 +
+- 良好的网络环境
+- 可选：`iperf3`（用于集群互联带宽测试）
 
-```powershell
-.\run_gui.ps1
-```
+### Python 策略
 
-Then open `http://127.0.0.1:28000`.
-
-### Linux
-
-#### Installation
-
-```bash
-bash install.bash
-```
-
-#### Start GUI
-
-```bash
-bash run_gui.sh
-```
-
-Then open `http://127.0.0.1:28000`.
-
-## Legacy training with scripts
+- 项目使用内置 Python 3.10（embedded）与项目内 `venv`。
+- 训练脚本与 GUI 启动脚本默认都走项目环境，不依赖系统 Python。
 
 ### Windows
 
-- Edit `train.ps1`, then run `./train.ps1`
-- Edit `train_by_toml.ps1`, then run `./train_by_toml.ps1`
+- 安装：运行 `install.ps1`。
+- 启动 GUI：运行 `run_gui.ps1`。
 
 ### Linux
 
-- Edit `train.sh`, then run `bash train.sh`
-- Edit `train_by_toml.sh`, then run `bash train_by_toml.sh`
+- 安装：运行 `install.bash`。
+- 启动 GUI：运行 `run_gui.sh`。
 
-`train*.sh` / `train*.ps1` use the project `venv` Python directly. Manual activation is not required.
+默认访问地址为本机 `127.0.0.1:28000`，监听 `0.0.0.0`，同局域网设备也可访问。
 
-## Cluster compatibility check (single + multi-node + mesh iperf3)
+## 集群兼容性与网络测试
 
-Unified checker script:
+项目已整合统一检查入口：
 
-- `cluster_compat_check.py` (core)
-- `cluster_compat_check.sh` (Linux launcher, runs in project `venv`)
-- `cluster_compat_check.ps1` (Windows launcher, runs in project `venv`)
+- `cluster_compat_check.sh`
+- `cluster_compat_check.ps1`
 
-### Interactive full flow (recommended)
+支持内容：
 
-Linux:
+- 基础环境检查
+- 单机 NCCL 兼容检查
+- 多机 NCCL 兼容检查（主从协同）
+- `iperf3` 网格互联带宽测试与结果汇总
 
-```bash
-bash cluster_compat_check.sh
-```
+## 新显卡与后端建议
 
-Windows:
+- 在 Torch 2.10 + Blackwell 架构场景，默认建议使用 SDPA 路径。
+- 实际可用 batch 仍需结合模型、分辨率、缓存策略和系统环境实测。
 
-```powershell
-.\cluster_compat_check.ps1
-```
+## 常见建议
 
-Flow:
+- resume 优先使用 `resume=*-state`。
+- 阶段分辨率适合在总训练预算接近时提升细节固化质量，但建议先小规模验证。
+- 多机训练前先做兼容性与网络测试，以及先完成一个小规模训练，避免正式任务中断。
 
-1. Run environment check (Python/driver/torch/NCCL availability/network brief). No `nvcc` check.
-2. Run single-node NCCL compatibility check.
-3. Ask whether to continue multi-node compatibility check.
-4. If `host` role is selected, input cluster size and test parameters; host starts waiting for workers.
-5. Workers input host IP/hostname/domain and connect, then enter waiting state.
-6. Host confirms and types `start`; NCCL distributed test starts.
-7. Output NCCL compatibility result table.
-8. Run `iperf3` pairwise mesh tests and output a bandwidth table.
+## 免责声明
 
-### Manual mode examples
-
-Env check only:
-
-```bash
-bash cluster_compat_check.sh --mode check-env
-```
-
-Single-node NCCL only:
-
-```bash
-bash cluster_compat_check.sh --mode single
-```
-
-Host mode:
-
-```bash
-bash cluster_compat_check.sh --mode host --cluster-size 2 --master-addr 192.168.50.219 --master-port 29500 --control-port 29610
-```
-
-Worker mode:
-
-```bash
-bash cluster_compat_check.sh --mode worker --host 192.168.50.219 --control-port 29610
-```
-
-All compatibility checks are now unified in `cluster_compat_check.py`.
-
-## TensorBoard
-
-Windows helper script:
-
-```powershell
-.\tensorboard.ps1
-```
-
-Starts TensorBoard at `http://127.0.0.1:6006` by default.
-
-## Program arguments
-
-| Parameter Name                | Type  | Default Value | Description                                      |
-|-------------------------------|-------|---------------|--------------------------------------------------|
-| `--host`                      | str   | "0.0.0.0"     | Hostname for the server                          |
-| `--port`                      | int   | 28000         | Port to run the server                           |
-| `--listen`                    | bool  | false         | Enable listening mode for the server             |
-| `--skip-prepare-environment`  | bool  | false         | Skip the environment preparation step            |
-| `--disable-tensorboard`       | bool  | false         | Disable TensorBoard                              |
-| `--disable-tageditor`         | bool  | false         | Disable tag editor                               |
-| `--tensorboard-host`          | str   | "0.0.0.0"     | Host to run TensorBoard                          |
-| `--tensorboard-port`          | int   | 6006          | Port to run TensorBoard                          |
-| `--localization`              | str   |               | Localization settings for the interface          |
+本项目用于模型训练流程管理与工程辅助。请在遵守相关法律法规、平台协议与数据合规要求的前提下使用。
