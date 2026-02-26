@@ -934,6 +934,7 @@ class NetworkTrainer:
                 json.dump(train_state, f)
 
         steps_from_state = None
+        epoch_from_state = None
 
         def load_model_hook(models, input_dir):
             # remove models except network
@@ -946,12 +947,13 @@ class NetworkTrainer:
             # print(f"load model hook: {len(models)} models will be loaded")
 
             # load current epoch and step to
-            nonlocal steps_from_state
+            nonlocal steps_from_state, epoch_from_state
             train_state_file = os.path.join(input_dir, "train_state.json")
             if os.path.exists(train_state_file):
                 with open(train_state_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                steps_from_state = data["current_step"]
+                steps_from_state = data.get("current_step")
+                epoch_from_state = data.get("current_epoch")
                 logger.info(f"load train state from {train_state_file}: {data}")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
@@ -1215,8 +1217,9 @@ class NetworkTrainer:
                 minimum_metadata[key] = metadata[key]
 
         # calculate steps to skip when resuming or starting from a specific step
+        explicit_initial_override = args.initial_epoch is not None or args.initial_step is not None
         initial_step = 0
-        if args.initial_epoch is not None or args.initial_step is not None:
+        if explicit_initial_override:
             # if initial_epoch or initial_step is specified, steps_from_state is ignored even when resuming
             if steps_from_state is not None:
                 logger.warning(
@@ -1232,7 +1235,7 @@ class NetworkTrainer:
         else:
             # if initial_epoch and initial_step are not specified, steps_from_state is used when resuming
             if steps_from_state is not None:
-                initial_step = steps_from_state
+                initial_step = int(steps_from_state)
                 steps_from_state = None
 
         if initial_step > 0:
@@ -1242,6 +1245,7 @@ class NetworkTrainer:
         resume_start_step = initial_step
 
         epoch_to_start = 0
+        step_based_epoch_to_start = 0
         if initial_step > 0:
             if args.skip_until_initial_step:
                 # if skip_until_initial_step is specified, load data and discard it to ensure the same data is used
@@ -1258,8 +1262,37 @@ class NetworkTrainer:
                 # if not, only epoch no is skipped for informative purpose
                 epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
                 initial_step = 0  # do not skip
+            step_based_epoch_to_start = epoch_to_start
+
+        if not explicit_initial_override and epoch_from_state is not None:
+            try:
+                state_epoch_to_start = max(0, int(epoch_from_state) - 1)
+                if state_epoch_to_start != step_based_epoch_to_start:
+                    logger.warning(
+                        "resume epoch mismatch detected: state epoch=%s, step-derived epoch=%s (step=%s, batches_per_epoch=%s). "
+                        "using state epoch to continue epoch numbering.",
+                        int(epoch_from_state),
+                        step_based_epoch_to_start + 1 if step_based_epoch_to_start > 0 else 1,
+                        resume_start_step,
+                        num_update_steps_per_epoch,
+                    )
+                epoch_to_start = state_epoch_to_start
+            except Exception:
+                logger.warning("failed to parse current_epoch from resume state, fallback to step-derived epoch", exc_info=True)
 
         global_step = resume_start_step
+
+        if epoch_to_start > step_based_epoch_to_start and global_step < args.max_train_steps:
+            remaining_steps = args.max_train_steps - global_step
+            needed_epochs_from_current = math.ceil(remaining_steps / num_update_steps_per_epoch)
+            min_total_epochs = epoch_to_start + needed_epochs_from_current
+            if num_train_epochs < min_total_epochs:
+                logger.warning(
+                    "num_train_epochs is increased from %s to %s to preserve both resumed epoch numbering and max_train_steps",
+                    num_train_epochs,
+                    min_total_epochs,
+                )
+                num_train_epochs = min_total_epochs
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
 
@@ -1312,14 +1345,15 @@ class NetworkTrainer:
             text_encoders = []
             text_encoder = None
 
-        # For --sample_at_first
-        optimizer_eval_fn()
-        self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
-        optimizer_train_fn()
         is_tracking = len(accelerator.trackers) > 0
-        if is_tracking:
-            # log empty object to commit the sample images to wandb
-            accelerator.log({}, step=0)
+        # For --sample_at_first (skip startup sample on resumed runs)
+        if not args.resume:
+            optimizer_eval_fn()
+            self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+            optimizer_train_fn()
+            if is_tracking:
+                # log empty object to commit the sample images to wandb
+                accelerator.log({}, step=0)
 
         # training loop
         if initial_step > 0:  # only if skip_until_initial_step is specified

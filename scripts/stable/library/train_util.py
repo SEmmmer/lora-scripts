@@ -5755,8 +5755,7 @@ def sample_images_common(
     StableDiffusionLongPromptWeightingPipelineの改造版を使うようにしたので、clip skipおよびプロンプトの重みづけに対応した
     """
 
-    # When resuming, skip the startup "epoch 0" sampling call.
-    # Keep periodic sampling behavior unchanged after training starts.
+    # On resume, skip only the startup "epoch 0" sampling call.
     if epoch == 0 and getattr(args, "resume", None):
         return
 
