@@ -80,7 +80,6 @@ BATCH_PROBE_NEW_PROCESS_MIN_DEDICATED_MIB = 512.0
 BATCH_PROBE_DEDICATED_NEAR_FULL_RATIO = 0.92
 BATCH_PROBE_DEDICATED_NEAR_FULL_FREE_MIB = 768.0
 BATCH_PROBE_MEMORY_SAMPLING_INTERVAL_SECONDS = 0.35
-BATCH_PROBE_PROGRESS_LOG_INTERVAL_SECONDS = 2.0
 BATCH_PROBE_SHARED_ADAPTER_DELTA_MIN_MIB = 256.0
 
 
@@ -2170,9 +2169,6 @@ def _run_single_batch_probe(
     runtime_platform = platform.platform()
     runtime_machine = platform.machine()
     runtime_python = platform.python_version()
-    sample_counter = 0
-    last_progress_log_at = 0.0
-    last_logged_pid_snapshot = tuple()
 
     def _fmt_mib(value) -> str:
         if value is None:
@@ -2247,13 +2243,6 @@ def _run_single_batch_probe(
 
     baseline_compute_memory = _query_gpu_compute_process_memory_mib(gpu_ids=gpu_ids)
     baseline_compute_map = baseline_compute_memory.get("processes", {}) if baseline_compute_memory.get("ok") else {}
-    log.info(
-        "[batch-probe] trial=%s baseline compute ok=%s pids=%s err=%s",
-        trial_index,
-        bool(baseline_compute_memory.get("ok")),
-        len(baseline_compute_map),
-        str(baseline_compute_memory.get("error", "")),
-    )
 
     baseline_shared_process_memory = {
         "ok": False,
@@ -2269,23 +2258,6 @@ def _run_single_batch_probe(
         if baseline_adapter_memory.get("ok"):
             adapter_shared_baseline_mib = float(baseline_adapter_memory.get("shared_mib") or 0.0)
             adapter_shared_peak_mib = float(adapter_shared_baseline_mib)
-        log.info(
-            "[batch-probe] trial=%s baseline shared_process ok=%s pids=%s err=%s",
-            trial_index,
-            bool(baseline_shared_process_memory.get("ok")),
-            len(baseline_shared_map),
-            str(baseline_shared_process_memory.get("error", "")),
-        )
-        log.info(
-            "[batch-probe] trial=%s baseline adapter_shared=%s adapter_dedicated=%s adapter=%s err=%s",
-            trial_index,
-            _fmt_mib(baseline_adapter_memory.get("shared_mib")),
-            _fmt_mib(baseline_adapter_memory.get("dedicated_mib")),
-            str(baseline_adapter_memory.get("adapter_name", "")),
-            str(baseline_adapter_memory.get("error", "")),
-        )
-    else:
-        log.info("[batch-probe] trial=%s shared-memory probing disabled for env=%s", trial_index, runtime_env_label)
 
     def _sample_probe_memory(launcher_pid: int):
         nonlocal probe_device_total_mib
@@ -2297,12 +2269,7 @@ def _run_single_batch_probe(
         nonlocal probe_has_unknown_dedicated
         nonlocal adapter_shared_peak_mib
         nonlocal adapter_shared_delta_peak_mib
-        nonlocal sample_counter
-        nonlocal last_progress_log_at
-        nonlocal last_logged_pid_snapshot
 
-        sample_counter += 1
-        now = time.time()
         device_memory = _query_gpu_memory_info(gpu_ids=gpu_ids)
         if device_memory.get("ok"):
             used_mib = float(device_memory.get("used_mib") or 0.0)
@@ -2332,18 +2299,9 @@ def _run_single_batch_probe(
                     candidate_pids.add(int(pid))
 
         if candidate_pids:
-            newly_added = sorted(int(pid) for pid in candidate_pids if pid not in tracked_probe_pids)
             tracked_probe_pids.update(candidate_pids)
             if probe_attribution_mode == "none":
                 probe_attribution_mode = "nvidia-compute"
-            if newly_added:
-                log.info(
-                    "[batch-probe] trial=%s discovered probe pids=%s attribution=%s sample=%s",
-                    trial_index,
-                    ",".join(map(str, newly_added)),
-                    probe_attribution_mode,
-                    sample_counter,
-                )
 
         if tracked_probe_pids and current_compute_map:
             dedicated_now = 0.0
@@ -2424,37 +2382,8 @@ def _run_single_batch_probe(
         else:
             probe_shared_delta_peak_mib = max(probe_shared_delta_peak_mib, delta_shared)
 
-        current_pid_snapshot = tuple(sorted(int(pid) for pid in tracked_probe_pids))
-        should_log_progress = (
-            (now - last_progress_log_at) >= BATCH_PROBE_PROGRESS_LOG_INTERVAL_SECONDS
-            or current_pid_snapshot != last_logged_pid_snapshot
-        )
-        if should_log_progress:
-            log.info(
-                "[batch-probe] trial=%s progress sample=%s gpu_used=%s/%s pid_count=%s pid_ded_peak=%s pid_ded_unknown=%s "
-                "process_shared_peak=%s process_shared_delta_peak=%s adapter_shared_peak=%s adapter_shared_delta_peak=%s",
-                trial_index,
-                sample_counter,
-                _fmt_mib(probe_device_used_peak_mib),
-                _fmt_mib(probe_device_total_mib),
-                len(current_pid_snapshot),
-                _fmt_mib(probe_dedicated_peak_mib),
-                bool(probe_has_unknown_dedicated),
-                _fmt_mib(probe_shared_peak_mib),
-                _fmt_mib(probe_shared_delta_peak_mib),
-                _fmt_mib(adapter_shared_peak_mib),
-                _fmt_mib(adapter_shared_delta_peak_mib),
-            )
-            last_progress_log_at = now
-            last_logged_pid_snapshot = current_pid_snapshot
-
     process = None
     try:
-        log.info(
-            "[batch-probe] trial=%s launch accelerate cmd=%s",
-            trial_index,
-            " ".join(shlex.quote(str(x)) for x in cmd),
-        )
         process = subprocess.Popen(
             cmd,
             cwd=str(repo_root),
@@ -2606,24 +2535,6 @@ def _run_single_batch_probe(
             f"delta={shared_mem_delta_mib:.1f}MiB,probe_dedicated_peak={float(probe_dedicated_peak_mib or 0.0):.1f}MiB,"
             f"gpu_peak={float(probe_device_used_peak_mib or 0.0):.1f}/{float(probe_device_total_mib or 0.0):.1f}MiB)"
         )
-
-    log.info(
-        "[batch-probe] trial=%s final status=%s reason=%s env=%s shared_source=%s shared_attributed=%s "
-        "shared_triggered=%s dedicated_significant=%s dedicated_near_full=%s tracked_pids=%s gpu_peak=%s/%s shared_delta=%s",
-        trial_index,
-        status,
-        reason,
-        runtime_env_label,
-        shared_metrics_source,
-        bool(probe_shared_attributed),
-        bool(probe_shared_triggered),
-        bool(probe_dedicated_significant),
-        bool(probe_dedicated_near_full),
-        ",".join(map(str, tracked_probe_pids_list)) if tracked_probe_pids_list else "none",
-        _fmt_mib(probe_device_used_peak_mib),
-        _fmt_mib(probe_device_total_mib),
-        _fmt_mib(shared_mem_delta_mib),
-    )
 
     shared_mem_probe = {
         "enabled": bool(shared_probe_enabled),
@@ -2782,11 +2693,6 @@ def probe_recommended_batch_size(
         high = max(low, min(start_batch - 1, est_high))
         if low > high:
             low, high = 1, max(1, start_batch - 1)
-        log.info(
-            "[batch-probe] first trial OOM, search range narrowed by estimate: low=%s high=%s",
-            low,
-            high,
-        )
         while low <= high and trial_index < max_trials:
             mid = (low + high) // 2
             result = run_candidate(mid)
