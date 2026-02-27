@@ -1066,6 +1066,80 @@ def _has_new_checkpoint_since(config: dict, repo_root: Path, started_at: float) 
     return False
 
 
+def _list_existing_training_artifacts_for_run(config: dict, repo_root: Path) -> list[Path]:
+    output_dir = _resolve_local_path(str(config.get("output_dir", "./output") or "./output"), repo_root)
+    if not output_dir.exists() or not output_dir.is_dir():
+        return []
+
+    output_name = str(config.get("output_name", "") or "").strip()
+    artifacts = {}
+
+    for ckpt_file in _list_checkpoint_files_for_run(config, repo_root):
+        if ckpt_file.is_file():
+            artifacts[str(ckpt_file.resolve())] = ckpt_file
+
+    for child in output_dir.iterdir():
+        if not child.is_dir():
+            continue
+        if output_name and not child.name.startswith(output_name):
+            continue
+
+        if child.name.endswith("-state"):
+            if (child / "train_state.json").is_file():
+                artifacts[str(child.resolve())] = child
+            continue
+
+        if (child / "model_index.json").is_file():
+            artifacts[str(child.resolve())] = child
+
+    return sorted(artifacts.values(), key=lambda p: p.name)
+
+
+def _validate_resume_launch_guard(config: dict, repo_root: Path) -> Tuple[bool, str]:
+    artifacts = _list_existing_training_artifacts_for_run(config, repo_root)
+    if not artifacts:
+        return True, ""
+
+    output_dir = _resolve_local_path(str(config.get("output_dir", "./output") or "./output"), repo_root)
+    resume_path_raw = str(config.get("resume", "") or "").strip()
+
+    if not resume_path_raw:
+        sample_names = ", ".join(p.name for p in artifacts[:3])
+        return (
+            False,
+            "检测到输出目录已存在历史训练结果，当前未填写 resume state 路径，已阻止启动。"
+            f" output_dir={output_dir}，匹配到 {len(artifacts)} 个结果（例如: {sample_names}）。"
+            "请填写同一输出目录下的 state 路径后重试。"
+        )
+
+    resume_dir = _resolve_local_path(resume_path_raw, repo_root)
+    if not resume_dir.exists() or not resume_dir.is_dir():
+        return (
+            False,
+            "resume 路径不存在或不是目录，已阻止启动。"
+            f" resume={resume_dir}"
+        )
+
+    train_state_file = resume_dir / "train_state.json"
+    if not train_state_file.is_file():
+        return (
+            False,
+            "resume 路径不是有效的 state 目录（缺少 train_state.json），已阻止启动。"
+            f" resume={resume_dir}"
+        )
+
+    try:
+        resume_dir.relative_to(output_dir)
+    except ValueError:
+        return (
+            False,
+            "检测到 output 与 resume 不属于同一个输出目录，已阻止启动。"
+            f" output_dir={output_dir}，resume={resume_dir}"
+        )
+
+    return True, ""
+
+
 def _cleanup_tensorboard_records_without_checkpoint(run_dir: Optional[Path], existed_before: bool, event_snapshot: dict):
     if run_dir is None or not run_dir.exists():
         return
@@ -3001,6 +3075,12 @@ def run_train(toml_path: str,
         runtime_train_config = toml.load(toml_path)
     except Exception as e:
         log.warning(f"[runtime-config] failed to parse training config before launch: {toml_path} ({e})")
+
+    if runtime_train_config:
+        guard_ok, guard_message = _validate_resume_launch_guard(runtime_train_config, repo_root)
+        if not guard_ok:
+            log.warning(f"[resume-guard] {guard_message}")
+            return APIResponse(status="error", message=guard_message)
 
     tensorboard_run_dir = _resolve_tensorboard_run_dir_from_config(runtime_train_config, repo_root) if runtime_train_config else None
     tensorboard_run_dir_existed_before = bool(tensorboard_run_dir and tensorboard_run_dir.exists())
