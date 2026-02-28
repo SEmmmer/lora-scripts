@@ -277,6 +277,7 @@ def _build_mixed_resolution_plan(
     toml_path: str,
     trainer_file: str,
     *,
+    num_processes_for_epoch_calc: int = 1,
     save_every_n_epochs_default: int = 1,
 ):
     if not _to_bool(config.get(MIXED_RESOLUTION_ENABLE_KEY), False):
@@ -346,12 +347,15 @@ def _build_mixed_resolution_plan(
         return None, ratio_error
     configured_ratio_sum_percent = sum(item[2] for item in configured_phases)
 
+    normalized_num_processes_for_epoch_calc = max(1, int(num_processes_for_epoch_calc))
+
     plan_signature_payload = {
         "trainer_name": trainer_name,
         "base_resolution": [base_side, base_side],
         "base_epochs": int(base_epochs),
         "base_batch": int(base_batch),
         "base_gradient_accumulation_steps": int(base_gradient_accumulation_steps),
+        "num_processes_for_epoch_calc": int(normalized_num_processes_for_epoch_calc),
         "save_every_n_epochs": int(save_every_n_epochs),
         "use_sample_epoch_schedule": bool(use_sample_epoch_schedule),
         "base_sample_every_n_epochs": int(base_sample_every_n_epochs) if base_sample_every_n_epochs is not None else None,
@@ -372,6 +376,9 @@ def _build_mixed_resolution_plan(
     total_train_images = _count_train_images_with_repeats(config, repo_root)
     if total_train_images <= 0:
         return None, "无法统计训练图像数量，无法生成阶段分辨率训练计划"
+    # Align with train_network.py epoch math in distributed mode:
+    # num_update_steps_per_epoch is based on per-process dataloader length.
+    per_process_train_images = max(1, int(math.ceil(total_train_images / normalized_num_processes_for_epoch_calc)))
 
     plan_base = Path(toml_path)
     phase_configs = []
@@ -409,7 +416,7 @@ def _build_mixed_resolution_plan(
         raw_epochs_this_phase = int(math.ceil(base_epochs * ratio * effective_batch_ratio))
         # Actual formula: ceil_to_multiple(raw_epochs, lcm(save_every_n_epochs, sample_every_n_epochs_phase))
         epochs_this_phase = _ceil_to_multiple(max(1, raw_epochs_this_phase), epoch_rounding_multiple)
-        batches_per_epoch = max(1, int(math.ceil(total_train_images / batch_this_phase)))
+        batches_per_epoch = max(1, int(math.ceil(per_process_train_images / batch_this_phase)))
         steps_per_epoch = max(1, int(math.ceil(batches_per_epoch / gradient_accumulation_steps_this_phase)))
         steps_this_phase = int(epochs_this_phase * steps_per_epoch)
 
@@ -511,6 +518,8 @@ def _build_mixed_resolution_plan(
         "base_gradient_accumulation_steps": int(base_gradient_accumulation_steps),
         "base_epochs": int(base_epochs),
         "total_train_images_with_repeats": int(total_train_images),
+        "num_processes_for_epoch_calc": int(normalized_num_processes_for_epoch_calc),
+        "per_process_train_images_with_repeats": int(per_process_train_images),
         "total_mixed_epochs": int(cumulative_epochs),
         "total_mixed_steps": int(cumulative_steps),
         "gradient_accumulation_steps_rule": "x=1 -> all phases keep 1; x>1 -> all phases keep x (anchored to 1024 baseline)",
@@ -3186,6 +3195,7 @@ def run_train(toml_path: str,
             runtime_train_config,
             toml_path,
             trainer_file,
+            num_processes_for_epoch_calc=total_num_processes,
         )
         if mixed_plan_error:
             return APIResponse(status="error", message=f"阶段分辨率训练配置错误: {mixed_plan_error}")
