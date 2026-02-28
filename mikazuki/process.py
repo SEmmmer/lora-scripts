@@ -33,6 +33,13 @@ LEGACY_DEFAULT_SYNC_CONFIG_KEYS = (
 )
 DEFAULT_SYNC_CONFIG_KEYS = "*"
 DEFAULT_SYNC_ASSET_KEYS = "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"
+WORKER_REQUIRED_SYNC_CONFIG_KEYS = ("model_train_type",)
+MODEL_TRAIN_TYPE_TO_TRAINER_FILE = {
+    "sd-lora": "./scripts/stable/train_network.py",
+    "sdxl-lora": "./scripts/stable/sdxl_train_network.py",
+    "sd-dreambooth": "./scripts/stable/train_db.py",
+    "sdxl-finetune": "./scripts/stable/sdxl_train.py",
+}
 WORKER_OUTPUT_MARKER = "THIS_IS_WORKER_NODE_CHECK_MAIN_OUTPUTS"
 DATASET_DIR_KEYS = ("train_data_dir", "reg_data_dir")
 MESH_NET_MONITOR_INTERVAL_SECONDS = 10
@@ -117,6 +124,17 @@ def _parse_sync_config_keys(value):
         return ["*"]
 
     return keys
+
+
+def _resolve_trainer_file_from_runtime_config(runtime_train_config: dict, fallback_trainer_file: str) -> str:
+    if not isinstance(runtime_train_config, dict):
+        return fallback_trainer_file
+
+    model_train_type = str(runtime_train_config.get("model_train_type", "") or "").strip().lower()
+    if not model_train_type:
+        return fallback_trainer_file
+
+    return MODEL_TRAIN_TYPE_TO_TRAINER_FILE.get(model_train_type, fallback_trainer_file)
 
 
 def _parse_resolution_pair(value: str) -> Optional[tuple[int, int]]:
@@ -1464,6 +1482,16 @@ def _sync_config_from_main(
     keys_to_sync = list(main_config.keys()) if sync_all else sync_keys
     if sync_all:
         log.info(f"[sync-config] full sync mode enabled: syncing all {len(keys_to_sync)} top-level keys")
+    else:
+        seen_keys = {str(k).strip().lower() for k in keys_to_sync}
+        for required_key in WORKER_REQUIRED_SYNC_CONFIG_KEYS:
+            if required_key.lower() in seen_keys:
+                continue
+            if required_key not in main_config:
+                continue
+            keys_to_sync.append(required_key)
+            seen_keys.add(required_key.lower())
+            log.info(f"[sync-config] append required key for worker launch consistency: {required_key}")
 
     changed = 0
     for key in keys_to_sync:
@@ -3075,6 +3103,14 @@ def run_train(toml_path: str,
         runtime_train_config = toml.load(toml_path)
     except Exception as e:
         log.warning(f"[runtime-config] failed to parse training config before launch: {toml_path} ({e})")
+
+    resolved_trainer_file = _resolve_trainer_file_from_runtime_config(runtime_train_config, trainer_file)
+    if resolved_trainer_file != trainer_file:
+        log.info(
+            "[sync-config] trainer script synced from main config: "
+            f"{trainer_file} -> {resolved_trainer_file}"
+        )
+        trainer_file = resolved_trainer_file
 
     if runtime_train_config:
         guard_ok, guard_message = _validate_resume_launch_guard(runtime_train_config, repo_root)

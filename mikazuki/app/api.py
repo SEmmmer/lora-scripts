@@ -275,6 +275,9 @@ async def create_toml_file(request: Request):
             log.error(f"Error while processing prompts: {e}")
             return APIResponseFail(message=str(e))
 
+    # Keep training type in autosave so worker can sync and choose the same trainer script.
+    config["model_train_type"] = model_train_type
+
     with open(toml_file, "w", encoding="utf-8") as f:
         f.write(toml.dumps(config))
 
