@@ -316,7 +316,11 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     trainTypeInput: null,
     trainTypeValue: "",
     scheduled: false,
-    updating: false
+    updating: false,
+    trainImageCountKey: "",
+    trainImageCount: null,
+    trainImageCountLoading: false,
+    trainImageCountError: ""
   };
 
   function getSchemaForm() {
@@ -451,6 +455,59 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     return true;
   }
 
+  function requestTrainImageCount(trainDataDir) {
+    var key = String(trainDataDir == null ? "" : trainDataDir).trim();
+    if (!key) {
+      state.trainImageCountKey = "";
+      state.trainImageCount = null;
+      state.trainImageCountLoading = false;
+      state.trainImageCountError = "";
+      return;
+    }
+
+    if (state.trainImageCountKey === key && (state.trainImageCountLoading || state.trainImageCount !== null || state.trainImageCountError)) {
+      return;
+    }
+
+    state.trainImageCountKey = key;
+    state.trainImageCount = null;
+    state.trainImageCountLoading = true;
+    state.trainImageCountError = "";
+
+    fetch("/api/staged_resolution_train_image_count", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ train_data_dir: key })
+    })
+      .then(function (resp) { return resp.json(); })
+      .then(function (data) {
+        if (state.trainImageCountKey !== key) return;
+        if (!data || data.status !== "success" || !data.data) {
+          state.trainImageCount = null;
+          state.trainImageCountError = data && data.message ? String(data.message) : "failed to count train images";
+          return;
+        }
+        var n = toInt(data.data.total_train_images_with_repeats, 0);
+        if (n > 0) {
+          state.trainImageCount = n;
+          state.trainImageCountError = "";
+        } else {
+          state.trainImageCount = null;
+          state.trainImageCountError = "total_train_images_with_repeats is invalid";
+        }
+      })
+      .catch(function () {
+        if (state.trainImageCountKey !== key) return;
+        state.trainImageCount = null;
+        state.trainImageCountError = "failed to count train images";
+      })
+      .finally(function () {
+        if (state.trainImageCountKey !== key) return;
+        state.trainImageCountLoading = false;
+        scheduleUpdate();
+      });
+  }
+
   function normalizeTrainTypeValue(raw) {
     return String(raw == null ? "" : raw).trim().toLowerCase();
   }
@@ -568,9 +625,13 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     return { ok: true, ratios: ratios, total: total };
   }
 
-  function buildPhasePreview(baseBatch, baseGradAccum, baseEpochs, saveEveryEpochs, baseSampleEveryEpochs, previewEnabled, phaseRatioPercents) {
+  function buildPhasePreview(baseBatch, baseGradAccum, baseEpochs, saveEveryEpochs, baseSampleEveryEpochs, previewEnabled, phaseRatioPercents, totalTrainImages, numProcesses) {
     var rows = [];
     var totalEpochs = 0;
+    var safeTrainImages = Math.max(0, toInt(totalTrainImages, 0));
+    var safeNumProcesses = Math.max(1, toInt(numProcesses, 1));
+    var hasOversizedBatchPhase = false;
+    var totalLoopEpochs = 0;
     for (var i = 0; i < PHASES.length; i++) {
       var phase = PHASES[i];
       var side = phase.side;
@@ -594,6 +655,26 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
         phaseEpochs = Math.max(1, ceilToMultiple(rawEpochs, epochRoundBase));
       }
       totalEpochs += phaseEpochs;
+
+      var batchesPerEpoch = null;
+      var stepsPerEpoch = null;
+      var phaseTargetSamples = null;
+      var phaseGlobalBatch = null;
+      var phaseLoopEpochs = null;
+      var loopEpochEquivalent = null;
+      if (safeTrainImages > 0 && phaseEpochs > 0) {
+        batchesPerEpoch = Math.max(1, Math.ceil(safeTrainImages / phaseBatch));
+        stepsPerEpoch = Math.max(1, Math.ceil(batchesPerEpoch / phaseGradAccum));
+        phaseTargetSamples = phaseEpochs * safeTrainImages;
+        phaseGlobalBatch = phaseBatch * phaseGradAccum * safeNumProcesses;
+        var phaseTargetSteps = Math.max(1, Math.ceil(phaseTargetSamples / Math.max(1, phaseGlobalBatch)));
+        phaseLoopEpochs = Math.max(1, Math.ceil(phaseTargetSteps / Math.max(1, stepsPerEpoch)));
+        loopEpochEquivalent = (stepsPerEpoch * phaseGlobalBatch) / safeTrainImages;
+        totalLoopEpochs += phaseLoopEpochs;
+        if (phaseBatch > safeTrainImages) {
+          hasOversizedBatchPhase = true;
+        }
+      }
       rows.push({
         side: side,
         ratioPercent: ratioPercent,
@@ -605,6 +686,12 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
         sampleScale: phase.sampleScale,
         rawEpochs: rawEpochs,
         epochs: phaseEpochs,
+        loopEpochs: phaseLoopEpochs,
+        phaseTargetSamples: phaseTargetSamples,
+        globalBatch: phaseGlobalBatch,
+        batchesPerEpoch: batchesPerEpoch,
+        stepsPerEpoch: stepsPerEpoch,
+        loopEpochEquivalent: loopEpochEquivalent,
         epochRoundBase: epochRoundBase,
         rawFormula: "ceil(" + baseEpochs + " * (" + ratioPercent + " / 100) * ((" + phaseBatch + "*" + phaseGradAccum + ") / (" + baseBatch + "*" + baseGradAccum + ")))",
         actualFormula: ratioPercent > 0
@@ -621,7 +708,11 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       baseGradAccum: baseGradAccum,
       saveEveryEpochs: saveEveryEpochs,
       baseSampleEveryEpochs: baseSampleEveryEpochs,
-      ratioSumPercent: rows.reduce(function (acc, row) { return acc + row.ratioPercent; }, 0)
+      ratioSumPercent: rows.reduce(function (acc, row) { return acc + row.ratioPercent; }, 0),
+      totalTrainImages: safeTrainImages,
+      numProcesses: safeNumProcesses,
+      totalLoopEpochs: totalLoopEpochs,
+      hasOversizedBatchPhase: hasOversizedBatchPhase
     };
   }
 
@@ -629,7 +720,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     var html = "";
     html += '<div class="stage-title">阶段分辨率预览（启用后将按以下计划训练）</div>';
     html += "<table>";
-    html += "<thead><tr><th>分辨率</th><th>占比(%)</th><th>Batch</th><th>梯度累加步数</th><th>CKPT 每 N Epoch</th><th>Sample 每 N Epoch</th><th>Raw Epoch</th><th>实际 Epoch</th><th>取整基数</th></tr></thead><tbody>";
+    html += "<thead><tr><th>分辨率</th><th>占比(%)</th><th>Batch</th><th>梯度累加步数</th><th>CKPT 每 N Epoch</th><th>Sample 每 N Epoch</th><th>Raw Epoch</th><th>等效 Epoch(样本口径)</th><th>Loop Epoch(训练器口径)</th><th>取整基数</th></tr></thead><tbody>";
     for (var i = 0; i < preview.rows.length; i++) {
       var row = preview.rows[i];
       html += "<tr>";
@@ -641,17 +732,26 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       html += "<td>" + row.sampleEveryEpochs + " (x" + row.sampleScale + ")</td>";
       html += "<td>" + row.rawEpochs + "</td>";
       html += "<td>" + row.epochs + "</td>";
+      html += "<td>" + (row.loopEpochs == null ? "-" : row.loopEpochs) + "</td>";
       html += "<td>" + row.epochRoundBase + "</td>";
       html += "</tr>";
     }
     html += "</tbody></table>";
-    html += '<div class="stage-note">总 Epoch（阶段累计）: ' + preview.totalEpochs + "；占比总和: " + preview.ratioSumPercent + "%（要求 ≤ 100%）</div>";
+    html += '<div class="stage-note">总等效 Epoch（阶段累计）: ' + preview.totalEpochs + "；占比总和: " + preview.ratioSumPercent + "%（要求 ≤ 100%）</div>";
+    if (preview.totalTrainImages > 0) {
+      html += '<div class="stage-note">数据集样本数（含 repeats）: ' + preview.totalTrainImages + "；num_processes: " + preview.numProcesses + "；总 Loop Epoch 估算: " + preview.totalLoopEpochs + "</div>";
+    } else {
+      html += '<div class="stage-note">未拿到数据集样本数，Loop Epoch 暂无法精确估算（可正常训练，不影响后端真实计算）。</div>';
+    }
     html += '<div class="stage-note">Raw 公式: raw_epoch = ceil(base_epoch * phase_ratio * ((phase_batch*phase_grad_accum) / (base_batch*base_grad_accum)))</div>';
     html += '<div class="stage-note">梯度累加规则: x=1 时全阶段保持 1；x>1 时全阶段保持 x（以 1024 基准为准），当前 x=' + preview.baseGradAccum + "</div>";
     if (preview.previewEnabled) {
       html += '<div class="stage-note">实际公式: actual_epoch = ceil_to_multiple(raw_epoch, lcm(phase_save_every_n_epochs, phase_sample_every_n_epochs))</div>';
     } else {
       html += '<div class="stage-note">实际公式: actual_epoch = ceil_to_multiple(raw_epoch, phase_save_every_n_epochs)（当前未启用训练预览图）</div>';
+    }
+    if (preview.hasOversizedBatchPhase) {
+      html += '<div class="stage-note">注意：存在 phase_batch > 数据集样本数。DataLoader 会重复采样补满 batch，不会留空位，因此 Loop Epoch 可能小于等效 Epoch。</div>';
     }
     html += '<div class="stage-note">CKPT 规则: 1024=x, 768=ceil(1.78x), 512=ceil(4x)，x=' + preview.saveEveryEpochs + "（可调占比）</div>";
     html += '<div class="stage-note">Sample 规则: 1024=x, 768=ceil(1.78x), 512=ceil(4x)，x=' + preview.baseSampleEveryEpochs + "（可调占比）</div>";
@@ -787,6 +887,14 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       /sample_every_n_epochs/i,
       /每\\s*n\\s*个\\s*epoch\\s*生成/
     ]);
+    var trainDataDirField = findSchemaField([
+      /train_data_dir/i,
+      /训练数据集路径/
+    ]);
+    var numProcessesField = findSchemaField([
+      /num_processes/i,
+      /进程数/
+    ]);
 
     var baseBatch = batchField ? readInt(batchField.item, 0) : 0;
     var baseGradAccum = gradAccumField ? readInt(gradAccumField.item, 1) : 1;
@@ -794,9 +902,14 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     var saveEveryEpochs = saveEveryField ? readInt(saveEveryField.item, 1) : 1;
     var previewEnabled = previewEnableField ? readBool(previewEnableField.item) : false;
     var baseSampleEveryEpochs = sampleEveryField ? readInt(sampleEveryField.item, 1) : 1;
+    var trainDataDir = trainDataDirField ? readText(trainDataDirField.item).trim() : "";
+    var numProcesses = numProcessesField ? readInt(numProcessesField.item, 1) : 1;
     if (baseGradAccum <= 0) baseGradAccum = 1;
     if (saveEveryEpochs <= 0) saveEveryEpochs = 1;
     if (baseSampleEveryEpochs <= 0) baseSampleEveryEpochs = 1;
+    if (numProcesses <= 0) numProcesses = 1;
+
+    requestTrainImageCount(trainDataDir);
 
     var ratioState = resolvePhaseRatios();
     if (!ratioState.ok) {
@@ -822,7 +935,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       saveEveryEpochs,
       baseSampleEveryEpochs,
       previewEnabled,
-      ratioState.ratios
+      ratioState.ratios,
+      state.trainImageCount,
+      numProcesses
     );
     if (statusBlock) {
       if (previewEnabled) {

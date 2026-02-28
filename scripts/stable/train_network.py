@@ -676,6 +676,10 @@ class NetworkTrainer:
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+        # Effective samples consumed by one training epoch (one full dataloader pass).
+        # This can differ from num_train_images when batch size is large and dataloader
+        # uses ceil() semantics, and should be used for resume epoch mapping.
+        effective_samples_per_epoch = int(max(1, num_update_steps_per_epoch * total_batch_size))
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
         if (args.save_n_epoch_ratio is not None) and (args.save_n_epoch_ratio > 0):
             args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
@@ -936,7 +940,7 @@ class NetworkTrainer:
             if args.initial_step is not None:
                 initial_global_samples = int(args.initial_step) * int(total_batch_size)
             else:
-                initial_global_samples = max(0, int(args.initial_epoch) - 1) * int(train_images_with_repeats)
+                initial_global_samples = max(0, int(args.initial_epoch) - 1) * int(effective_samples_per_epoch)
         else:
             # Prefer sample-based progress across topology changes.
             if global_samples_from_state is not None:
@@ -959,7 +963,7 @@ class NetworkTrainer:
         if not explicit_initial_override and resume_step_from_state is not None:
             resume_start_step = int(resume_step_from_state)
 
-        epoch_to_start = int(current_global_samples.value // max(1, train_images_with_repeats))
+        epoch_to_start = int(current_global_samples.value // max(1, effective_samples_per_epoch))
         step_based_epoch_to_start = epoch_to_start
         if initial_step > 0 and args.skip_until_initial_step:
             if args.skip_until_initial_step:
@@ -1013,8 +1017,8 @@ class NetworkTrainer:
                 num_train_epochs = min_total_epochs
 
         completed_epochs_before_run = max(0, int(epoch_to_start))
-        accelerator.print(f"  completed epochs before this run: {completed_epochs_before_run:,}")
-        accelerator.print(f"  target epoch index in this run: {int(num_train_epochs):,}")
+        accelerator.print(f"  completed loop-epochs before this run: {completed_epochs_before_run:,}")
+        accelerator.print(f"  target loop-epoch index in this run: {int(num_train_epochs):,}")
         if getattr(args, "target_global_train_samples", None) is not None:
             target_samples_total = int(args.target_global_train_samples)
             completed_samples = int(current_global_samples.value)
@@ -1028,6 +1032,13 @@ class NetworkTrainer:
                 f"{int(global_step):,}/{int(args.max_train_steps):,} "
                 f"(remaining~{remaining_steps_from_samples:,}, global_batch={int(total_batch_size):,})"
             )
+            if int(train_images_with_repeats) > 0:
+                equivalent_completed_epochs = float(completed_samples) / float(train_images_with_repeats)
+                equivalent_target_epochs = float(target_samples_total) / float(train_images_with_repeats)
+                accelerator.print(
+                    "  equivalent epoch progress (sample-based): "
+                    f"{equivalent_completed_epochs:.2f}/{equivalent_target_epochs:.2f}"
+                )
         else:
             remaining_steps_to_go = max(0, int(args.max_train_steps) - int(global_step))
             accelerator.print(

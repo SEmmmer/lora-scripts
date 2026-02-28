@@ -337,6 +337,36 @@ async def probe_batch_size(request: Request):
     return APIResponseSuccess(message=result.get("message"), data=result.get("data"))
 
 
+@router.post("/staged_resolution_train_image_count")
+async def staged_resolution_train_image_count(request: Request):
+    try:
+        payload = json.loads((await request.body()).decode("utf-8"))
+    except json.JSONDecodeError:
+        return APIResponseFail(message="Invalid JSON payload")
+
+    if not isinstance(payload, dict):
+        return APIResponseFail(message="Invalid payload type")
+
+    train_data_dir = str(payload.get("train_data_dir", "") or "").strip()
+    if not train_data_dir:
+        return APIResponseFail(message="missing train_data_dir")
+
+    config = {"train_data_dir": train_data_dir}
+    try:
+        total = int(process._count_train_images_with_repeats(config, launch_utils.base_dir_path()))
+    except Exception as e:
+        log.warning(f"failed to count train images for staged preview: {e}")
+        return APIResponseFail(message=f"failed to count train images: {e}")
+
+    if total <= 0:
+        return APIResponseFail(message="no train images found under train_data_dir")
+
+    return APIResponseSuccess(
+        message="ok",
+        data={"total_train_images_with_repeats": int(total)},
+    )
+
+
 @router.post("/run_script")
 async def run_script(request: Request, background_tasks: BackgroundTasks):
     try:

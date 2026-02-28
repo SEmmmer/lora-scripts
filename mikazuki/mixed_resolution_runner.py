@@ -72,6 +72,59 @@ def _check_state_dir_complete(state_dir: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _build_state_candidate_from_dir(state_dir: Path) -> tuple[Optional[dict[str, Any]], str]:
+    if not state_dir.exists() or not state_dir.is_dir():
+        return None, "not a directory"
+
+    complete, incomplete_reason = _check_state_dir_complete(state_dir)
+    if not complete:
+        return None, incomplete_reason
+
+    state_file = state_dir / "train_state.json"
+    step_num = -1
+    epoch_num = -1
+    sample_num = -1
+    state_data: dict[str, Any] = {}
+    if state_file.exists():
+        try:
+            state_data = json.loads(state_file.read_text(encoding="utf-8"))
+            step_num = _safe_int(state_data.get("current_step", -1), -1)
+            epoch_num = _safe_int(state_data.get("current_epoch", -1), -1)
+            sample_num = _safe_int(state_data.get("current_global_samples", -1), -1)
+        except Exception:
+            pass
+
+    if step_num < 0 or epoch_num < 0:
+        # fallback for legacy folders without readable train_state
+        match = re.search(r"-(\d+)-state$", state_dir.name)
+        epoch_num = _safe_int(match.group(1), -1) if match else -1
+
+    try:
+        mtime = state_dir.stat().st_mtime
+    except Exception:
+        mtime = 0
+
+    plan_id = None
+    phase_target_global_samples = -1
+    if isinstance(state_data, dict):
+        plan_id_raw = str(state_data.get("staged_plan_id", "") or "").strip()
+        plan_id = plan_id_raw if plan_id_raw else None
+        phase_target_global_samples = _safe_int(state_data.get("staged_phase_target_global_samples", -1), -1)
+
+    return (
+        {
+            "path": state_dir,
+            "step_num": int(step_num),
+            "epoch_num": int(epoch_num),
+            "sample_num": int(sample_num),
+            "phase_target_global_samples": int(phase_target_global_samples),
+            "mtime": float(mtime),
+            "plan_id": plan_id,
+        },
+        "",
+    )
+
+
 def _collect_state_candidates(config: dict, repo_root: Path) -> list[dict[str, Any]]:
     output_dir = _resolve_local_path(str(config.get("output_dir", "./output") or "./output"), repo_root)
     if not output_dir.exists() or not output_dir.is_dir():
@@ -84,49 +137,11 @@ def _collect_state_candidates(config: dict, repo_root: Path) -> list[dict[str, A
             continue
         if output_name and not entry.name.startswith(f"{output_name}-"):
             continue
-        complete, incomplete_reason = _check_state_dir_complete(entry)
-        if not complete:
-            log.warning(f"[staged-resolution] skip incomplete state dir: {entry} ({incomplete_reason})")
+        candidate, reason = _build_state_candidate_from_dir(entry)
+        if candidate is None:
+            log.warning(f"[staged-resolution] skip incomplete state dir: {entry} ({reason})")
             continue
-        state_file = entry / "train_state.json"
-        step_num = -1
-        epoch_num = -1
-        sample_num = -1
-        state_data = {}
-        if state_file.exists():
-            try:
-                state_data = json.loads(state_file.read_text(encoding="utf-8"))
-                step_num = _safe_int(state_data.get("current_step", -1), -1)
-                epoch_num = _safe_int(state_data.get("current_epoch", -1), -1)
-                sample_num = _safe_int(state_data.get("current_global_samples", -1), -1)
-            except Exception:
-                pass
-        if step_num < 0 or epoch_num < 0:
-            # fallback for legacy folders without readable train_state
-            match = re.search(r"-(\d+)-state$", entry.name)
-            epoch_num = _safe_int(match.group(1), -1) if match else -1
-        try:
-            mtime = entry.stat().st_mtime
-        except Exception:
-            mtime = 0
-        plan_id = None
-        phase_target_global_samples = -1
-        if isinstance(state_data, dict):
-            plan_id_raw = str(state_data.get("staged_plan_id", "") or "").strip()
-            plan_id = plan_id_raw if plan_id_raw else None
-            phase_target_global_samples = _safe_int(state_data.get("staged_phase_target_global_samples", -1), -1)
-
-        candidates.append(
-            {
-                "path": entry,
-                "step_num": int(step_num),
-                "epoch_num": int(epoch_num),
-                "sample_num": int(sample_num),
-                "phase_target_global_samples": int(phase_target_global_samples),
-                "mtime": float(mtime),
-                "plan_id": plan_id,
-            }
-        )
+        candidates.append(candidate)
 
     candidates.sort(
         key=lambda x: (
@@ -250,15 +265,46 @@ def _infer_resume_context(
     total_target_global_samples = int(phases[-1].get("target_global_train_samples", 0) or 0)
     use_sample_progress = total_target_global_samples > 0
     plan_id = str(plan.get("plan_id", "") or "").strip() or None
-    latest_state = _select_latest_state_candidate(
-        first_phase_config,
-        repo_root,
-        max_samples=total_target_global_samples if use_sample_progress else None,
-        min_samples_exclusive=None,
-        max_step=(None if use_sample_progress else (total_target_max_steps if total_target_max_steps > 0 else None)),
-        min_step_exclusive=None,
-        plan_id=plan_id,
-    )
+
+    latest_state = None
+    resume_value = str(first_phase_config.get("resume", "") or "").strip()
+    if explicit_resume and resume_value and resume_value != MIXED_RESOLUTION_RESUME_SENTINEL:
+        explicit_resume_path = _resolve_local_path(resume_value, repo_root)
+        if explicit_resume_path.exists() and explicit_resume_path.is_dir():
+            explicit_state, explicit_reason = _build_state_candidate_from_dir(explicit_resume_path)
+            if explicit_state is None:
+                log.warning(
+                    "[staged-resolution] explicit resume state cannot be parsed for phase inference: "
+                    f"{explicit_resume_path} ({explicit_reason}), fallback to auto detection"
+                )
+            else:
+                state_plan_id = explicit_state.get("plan_id")
+                if plan_id and state_plan_id is not None and state_plan_id != plan_id:
+                    log.warning(
+                        "[staged-resolution] explicit resume state plan_id mismatch: "
+                        f"state={state_plan_id}, current={plan_id}. continue with explicit state as requested."
+                    )
+                latest_state = explicit_state
+                log.info(
+                    "[staged-resolution] explicit resume state is used for phase inference: "
+                    f"{explicit_resume_path}"
+                )
+        else:
+            log.info(
+                "[staged-resolution] explicit resume is not a local state directory, "
+                "fallback to auto state detection"
+            )
+
+    if latest_state is None:
+        latest_state = _select_latest_state_candidate(
+            first_phase_config,
+            repo_root,
+            max_samples=total_target_global_samples if use_sample_progress else None,
+            min_samples_exclusive=None,
+            max_step=(None if use_sample_progress else (total_target_max_steps if total_target_max_steps > 0 else None)),
+            min_step_exclusive=None,
+            plan_id=plan_id,
+        )
     if latest_state is None and use_sample_progress:
         # Backward compatibility for legacy states that don't contain sample metadata.
         latest_state = _select_latest_state_candidate(
