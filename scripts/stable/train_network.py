@@ -257,6 +257,7 @@ class NetworkTrainer:
 
         current_epoch = _create_counter_value(0, "current_epoch", args)
         current_step = _create_counter_value(0, "current_step", args)
+        current_global_samples = _create_counter_value(0, "current_global_samples", args)
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
         collator = train_util.collator_class(current_epoch, current_step, ds_for_collator)
 
@@ -442,8 +443,32 @@ class NetworkTrainer:
             persistent_workers=args.persistent_data_loader_workers,
         )
 
-        # 学習ステップ数を計算する
-        if args.max_train_epochs is not None:
+        # Keep training budget topology-agnostic: track target samples globally
+        # and convert them to optimizer steps for the current world size.
+        train_images_with_repeats = int(train_dataset_group.num_train_images)
+        total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+        target_global_train_samples = getattr(args, "target_global_train_samples", None)
+        try:
+            target_global_train_samples = int(target_global_train_samples) if target_global_train_samples is not None else None
+        except Exception:
+            target_global_train_samples = None
+        if target_global_train_samples is not None and target_global_train_samples <= 0:
+            target_global_train_samples = None
+
+        if target_global_train_samples is None:
+            if args.max_train_epochs is not None:
+                target_global_train_samples = int(args.max_train_epochs) * int(train_images_with_repeats)
+            elif args.max_train_steps is not None:
+                target_global_train_samples = int(args.max_train_steps) * int(total_batch_size)
+
+        if target_global_train_samples is not None:
+            args.target_global_train_samples = int(target_global_train_samples)
+            args.max_train_steps = max(1, int(math.ceil(args.target_global_train_samples / max(1, total_batch_size))))
+            accelerator.print(
+                "override steps from global sample target / グローバルサンプル目標からステップ数を再計算: "
+                f"target_samples={args.target_global_train_samples}, steps={args.max_train_steps}"
+            )
+        elif args.max_train_epochs is not None:
             args.max_train_steps = args.max_train_epochs * math.ceil(
                 len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
             )
@@ -571,8 +596,18 @@ class NetworkTrainer:
             train_state_file = os.path.join(output_dir, "train_state.json")
             # +1 is needed because the state is saved before current_step is set from global_step
             logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {current_step.value+1}")
-            train_state = {"current_epoch": current_epoch.value, "current_step": current_step.value + 1}
-            for key in ("staged_plan_id", "staged_phase_index", "staged_phase_target_max_train_steps"):
+            train_state = {
+                "current_epoch": current_epoch.value,
+                "current_step": current_step.value + 1,
+                "current_global_samples": int(current_global_samples.value),
+            }
+            for key in (
+                "staged_plan_id",
+                "staged_phase_index",
+                "staged_phase_target_max_train_steps",
+                "staged_phase_target_global_samples",
+                "target_global_train_samples",
+            ):
                 value = getattr(args, key, None)
                 if value is not None:
                     train_state[key] = value
@@ -591,6 +626,7 @@ class NetworkTrainer:
 
         steps_from_state = None
         epoch_from_state = None
+        global_samples_from_state = None
         active_time_from_state = None
         tensorboard_walltime_base_from_state = None
 
@@ -605,13 +641,14 @@ class NetworkTrainer:
             # print(f"load model hook: {len(models)} models will be loaded")
 
             # load current epoch and step to
-            nonlocal steps_from_state, epoch_from_state, active_time_from_state, tensorboard_walltime_base_from_state
+            nonlocal steps_from_state, epoch_from_state, global_samples_from_state, active_time_from_state, tensorboard_walltime_base_from_state
             train_state_file = os.path.join(input_dir, "train_state.json")
             if os.path.exists(train_state_file):
                 with open(train_state_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 steps_from_state = data.get("current_step")
                 epoch_from_state = data.get("current_epoch")
+                global_samples_from_state = data.get("current_global_samples")
                 active_time_from_state = data.get("active_training_time_sec")
                 tensorboard_walltime_base_from_state = data.get("tensorboard_walltime_base")
                 logger.info(f"load train state from {train_state_file}: {data}")
@@ -645,19 +682,23 @@ class NetworkTrainer:
 
         # 学習する
         # TODO: find a way to handle total batch size when there are multiple datasets
-        total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
         accelerator.print("running training / 学習開始")
-        accelerator.print(f"  num train images * repeats / 学習画像の数×繰り返し回数: {train_dataset_group.num_train_images}")
-        accelerator.print(f"  num reg images / 正則化画像の数: {train_dataset_group.num_reg_images}")
-        accelerator.print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
-        accelerator.print(f"  num epochs / epoch数: {num_train_epochs}")
+        accelerator.print(
+            f"  num train images * repeats / 学習画像の数×繰り返し回数: {int(train_dataset_group.num_train_images):,}"
+        )
+        accelerator.print(f"  num reg images / 正則化画像の数: {int(train_dataset_group.num_reg_images):,}")
+        accelerator.print(f"  num batches per epoch / 1epochのバッチ数: {int(len(train_dataloader)):,}")
         accelerator.print(
             f"  batch size per device / バッチサイズ: {', '.join([str(d.batch_size) for d in train_dataset_group.datasets])}"
         )
         # accelerator.print(f"  total train batch size (with parallel & distributed & accumulation) / 総バッチサイズ（並列学習、勾配合計含む）: {total_batch_size}")
         accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
-        accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
+        accelerator.print(f"  total optimization steps (topology-dependent): {int(args.max_train_steps):,}")
+        if getattr(args, "target_global_train_samples", None) is not None:
+            accelerator.print(
+                f"  target global samples (topology-agnostic): {int(args.target_global_train_samples):,}"
+            )
 
         # TODO refactor metadata creation and move to util
         metadata = {
@@ -674,6 +715,8 @@ class NetworkTrainer:
             "ss_gradient_checkpointing": args.gradient_checkpointing,
             "ss_gradient_accumulation_steps": args.gradient_accumulation_steps,
             "ss_max_train_steps": args.max_train_steps,
+            "ss_target_global_train_samples": getattr(args, "target_global_train_samples", None),
+            "ss_effective_global_batch_size": total_batch_size,
             "ss_lr_warmup_steps": args.lr_warmup_steps,
             "ss_lr_scheduler": args.lr_scheduler,
             "ss_network_module": args.network_module,
@@ -876,35 +919,49 @@ class NetworkTrainer:
 
         # calculate steps to skip when resuming or starting from a specific step
         explicit_initial_override = args.initial_epoch is not None or args.initial_step is not None
-        initial_step = 0
+        initial_global_samples = 0
+        resume_step_from_state = None
+        if steps_from_state is not None:
+            try:
+                resume_step_from_state = max(0, int(steps_from_state))
+            except Exception:
+                resume_step_from_state = None
         if explicit_initial_override:
-            # if initial_epoch or initial_step is specified, steps_from_state is ignored even when resuming
-            if steps_from_state is not None:
+            # if initial_epoch or initial_step is specified, state progress is ignored
+            if steps_from_state is not None or global_samples_from_state is not None:
                 logger.warning(
-                    "steps from the state is ignored because initial_step is specified / initial_stepが指定されているため、stateからのステップ数は無視されます"
+                    "progress from the state is ignored because initial_step/initial_epoch is specified / "
+                    "initial_step または initial_epoch が指定されているため、state の進捗は無視されます"
                 )
             if args.initial_step is not None:
-                initial_step = args.initial_step
+                initial_global_samples = int(args.initial_step) * int(total_batch_size)
             else:
-                # num steps per epoch is calculated by num_processes and gradient_accumulation_steps
-                initial_step = (args.initial_epoch - 1) * math.ceil(
-                    len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
-                )
+                initial_global_samples = max(0, int(args.initial_epoch) - 1) * int(train_images_with_repeats)
         else:
-            # if initial_epoch and initial_step are not specified, steps_from_state is used when resuming
-            if steps_from_state is not None:
-                initial_step = int(steps_from_state)
+            # Prefer sample-based progress across topology changes.
+            if global_samples_from_state is not None:
+                try:
+                    initial_global_samples = max(0, int(global_samples_from_state))
+                except Exception:
+                    initial_global_samples = 0
+            elif steps_from_state is not None:
+                initial_global_samples = max(0, int(steps_from_state)) * int(total_batch_size)
                 steps_from_state = None
 
-        if initial_step > 0:
+        current_global_samples.value = int(max(0, initial_global_samples))
+        initial_step = int(current_global_samples.value // max(1, total_batch_size))
+
+        if initial_step > 0 and getattr(args, "target_global_train_samples", None) is None:
             assert (
                 args.max_train_steps > initial_step
             ), f"max_train_steps should be greater than initial step / max_train_stepsは初期ステップより大きい必要があります: {args.max_train_steps} vs {initial_step}"
         resume_start_step = initial_step
+        if not explicit_initial_override and resume_step_from_state is not None:
+            resume_start_step = int(resume_step_from_state)
 
-        epoch_to_start = 0
-        step_based_epoch_to_start = 0
-        if initial_step > 0:
+        epoch_to_start = int(current_global_samples.value // max(1, train_images_with_repeats))
+        step_based_epoch_to_start = epoch_to_start
+        if initial_step > 0 and args.skip_until_initial_step:
             if args.skip_until_initial_step:
                 # if skip_until_initial_step is specified, load data and discard it to ensure the same data is used
                 if not args.resume:
@@ -916,13 +973,11 @@ class NetworkTrainer:
 
                 # set epoch to start to make initial_step less than len(train_dataloader)
                 epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-            else:
-                # if not, only epoch no is skipped for informative purpose
-                epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-                initial_step = 0  # do not skip
             step_based_epoch_to_start = epoch_to_start
+        elif initial_step > 0 and not args.skip_until_initial_step:
+            initial_step = 0  # do not skip dataloader batches
 
-        if not explicit_initial_override and epoch_from_state is not None:
+        if not explicit_initial_override and epoch_from_state is not None and global_samples_from_state is None:
             try:
                 resume_epoch_offset = int(getattr(args, "resume_epoch_offset", 0) or 0)
                 state_epoch_to_start = max(0, int(epoch_from_state) - 1 + resume_epoch_offset)
@@ -941,7 +996,11 @@ class NetworkTrainer:
 
         global_step = resume_start_step
 
-        if epoch_to_start > step_based_epoch_to_start and global_step < args.max_train_steps:
+        if (
+            getattr(args, "target_global_train_samples", None) is None
+            and epoch_to_start > step_based_epoch_to_start
+            and global_step < args.max_train_steps
+        ):
             remaining_steps = args.max_train_steps - global_step
             needed_epochs_from_current = math.ceil(remaining_steps / num_update_steps_per_epoch)
             min_total_epochs = epoch_to_start + needed_epochs_from_current
@@ -952,9 +1011,39 @@ class NetworkTrainer:
                     min_total_epochs,
                 )
                 num_train_epochs = min_total_epochs
+
+        completed_epochs_before_run = max(0, int(epoch_to_start))
+        accelerator.print(f"  completed epochs before this run: {completed_epochs_before_run:,}")
+        accelerator.print(f"  target epoch index in this run: {int(num_train_epochs):,}")
+        if getattr(args, "target_global_train_samples", None) is not None:
+            target_samples_total = int(args.target_global_train_samples)
+            completed_samples = int(current_global_samples.value)
+            remaining_samples = max(0, target_samples_total - completed_samples)
+            remaining_steps_from_samples = int(math.ceil(remaining_samples / max(1, total_batch_size)))
+            accelerator.print(
+                f"  sample progress: {completed_samples:,}/{target_samples_total:,} (remaining {remaining_samples:,})"
+            )
+            accelerator.print(
+                "  step progress in this run: "
+                f"{int(global_step):,}/{int(args.max_train_steps):,} "
+                f"(remaining~{remaining_steps_from_samples:,}, global_batch={int(total_batch_size):,})"
+            )
+        else:
+            remaining_steps_to_go = max(0, int(args.max_train_steps) - int(global_step))
+            accelerator.print(
+                "  step progress in this run: "
+                f"{int(global_step):,}/{int(args.max_train_steps):,} (remaining {remaining_steps_to_go:,})"
+            )
+
+        progress_total_steps = int(args.max_train_steps)
+        if getattr(args, "target_global_train_samples", None) is not None:
+            remaining_samples = max(0, int(args.target_global_train_samples) - int(current_global_samples.value))
+            remaining_steps = int(math.ceil(remaining_samples / max(1, total_batch_size)))
+            progress_total_steps = max(int(global_step) + max(1, remaining_steps), int(global_step) + 1)
+
         progress_bar = tqdm(
-            total=args.max_train_steps,
-            initial=min(global_step, args.max_train_steps),
+            total=progress_total_steps,
+            initial=min(global_step, progress_total_steps),
             smoothing=0.5,
             disable=not accelerator.is_local_main_process,
             desc="steps",
@@ -1023,6 +1112,7 @@ class NetworkTrainer:
                 initial_step -= len(train_dataloader)
             global_step = resume_start_step
 
+        stop_training = False
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
@@ -1161,6 +1251,7 @@ class NetworkTrainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+                    current_global_samples.value = int(current_global_samples.value + total_batch_size)
 
                     self.sample_images(accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
@@ -1194,7 +1285,12 @@ class NetworkTrainer:
                     )
                     self.accelerator_logging(accelerator, logs, step_value=global_step)
 
-                if global_step >= args.max_train_steps:
+                if getattr(args, "target_global_train_samples", None) is not None:
+                    if int(current_global_samples.value) >= int(args.target_global_train_samples):
+                        stop_training = True
+                        break
+                elif global_step >= args.max_train_steps:
+                    stop_training = True
                     break
 
             if args.logging_dir is not None:
@@ -1221,6 +1317,8 @@ class NetworkTrainer:
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
             # end of epoch
+            if stop_training:
+                break
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())
@@ -1371,6 +1469,8 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--staged_plan_id", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--staged_phase_index", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--staged_phase_target_max_train_steps", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--staged_phase_target_global_samples", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--target_global_train_samples", type=int, default=None, help=argparse.SUPPRESS)
     # parser.add_argument("--loraplus_lr_ratio", default=None, type=float, help="LoRA+ learning rate ratio")
     # parser.add_argument("--loraplus_unet_lr_ratio", default=None, type=float, help="LoRA+ UNet learning rate ratio")
     # parser.add_argument("--loraplus_text_encoder_lr_ratio", default=None, type=float, help="LoRA+ text encoder learning rate ratio")

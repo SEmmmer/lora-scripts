@@ -4588,7 +4588,10 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     Unified API to get any scheduler from its name.
     """
     name = args.lr_scheduler
-    num_training_steps = args.max_train_steps * num_processes  # * args.gradient_accumulation_steps
+    # Keep scheduler progress tied to optimizer updates of this run.
+    # Do not scale by process count, otherwise distributed runs with the same
+    # epoch setting decay LR much slower than single-process runs.
+    num_training_steps = args.max_train_steps
     num_warmup_steps: Optional[int] = (
         int(args.lr_warmup_steps * num_training_steps) if isinstance(args.lr_warmup_steps, float) else args.lr_warmup_steps
     )

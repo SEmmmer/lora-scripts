@@ -91,12 +91,14 @@ def _collect_state_candidates(config: dict, repo_root: Path) -> list[dict[str, A
         state_file = entry / "train_state.json"
         step_num = -1
         epoch_num = -1
+        sample_num = -1
         state_data = {}
         if state_file.exists():
             try:
                 state_data = json.loads(state_file.read_text(encoding="utf-8"))
                 step_num = _safe_int(state_data.get("current_step", -1), -1)
                 epoch_num = _safe_int(state_data.get("current_epoch", -1), -1)
+                sample_num = _safe_int(state_data.get("current_global_samples", -1), -1)
             except Exception:
                 pass
         if step_num < 0 or epoch_num < 0:
@@ -108,21 +110,33 @@ def _collect_state_candidates(config: dict, repo_root: Path) -> list[dict[str, A
         except Exception:
             mtime = 0
         plan_id = None
+        phase_target_global_samples = -1
         if isinstance(state_data, dict):
             plan_id_raw = str(state_data.get("staged_plan_id", "") or "").strip()
             plan_id = plan_id_raw if plan_id_raw else None
+            phase_target_global_samples = _safe_int(state_data.get("staged_phase_target_global_samples", -1), -1)
 
         candidates.append(
             {
                 "path": entry,
                 "step_num": int(step_num),
                 "epoch_num": int(epoch_num),
+                "sample_num": int(sample_num),
+                "phase_target_global_samples": int(phase_target_global_samples),
                 "mtime": float(mtime),
                 "plan_id": plan_id,
             }
         )
 
-    candidates.sort(key=lambda x: (x["step_num"], x["epoch_num"], x["mtime"]), reverse=True)
+    candidates.sort(
+        key=lambda x: (
+            x.get("sample_num", -1),
+            x["step_num"],
+            x["epoch_num"],
+            x["mtime"],
+        ),
+        reverse=True,
+    )
     return candidates
 
 
@@ -130,6 +144,8 @@ def _select_latest_state_candidate(
     config: dict,
     repo_root: Path,
     *,
+    max_samples: Optional[int] = None,
+    min_samples_exclusive: Optional[int] = None,
     max_step: Optional[int] = None,
     min_step_exclusive: Optional[int] = None,
     plan_id: Optional[str] = None,
@@ -142,14 +158,24 @@ def _select_latest_state_candidate(
         result = []
         for item in items:
             step_num = int(item.get("step_num", -1))
+            sample_num = int(item.get("sample_num", -1))
             state_plan_id = item.get("plan_id")
 
-            if step_num < 0:
-                # For robust phase resume matching we need numeric steps.
+            if max_samples is not None and sample_num < 0:
+                # Sample-bounded matching requires sample progress metadata.
+                continue
+            if max_samples is not None and sample_num > int(max_samples):
+                continue
+            if min_samples_exclusive is not None and sample_num <= int(min_samples_exclusive):
+                continue
+            if (max_step is not None or min_step_exclusive is not None) and step_num < 0:
                 continue
             if max_step is not None and step_num > int(max_step):
                 continue
             if min_step_exclusive is not None and step_num <= int(min_step_exclusive):
+                continue
+            if sample_num < 0 and step_num < 0:
+                # Need at least one numeric progress metric.
                 continue
 
             if plan_id:
@@ -215,39 +241,65 @@ def _infer_resume_context(
             "completed": False,
             "resume_state_dir": "",
             "resume_step": None,
+            "resume_samples": None,
             "intra_phase_resume": False,
             "apply_boundary_offset": False,
         }
 
     total_target_max_steps = int(phases[-1].get("target_max_train_steps", 0) or 0)
+    total_target_global_samples = int(phases[-1].get("target_global_train_samples", 0) or 0)
+    use_sample_progress = total_target_global_samples > 0
     plan_id = str(plan.get("plan_id", "") or "").strip() or None
     latest_state = _select_latest_state_candidate(
         first_phase_config,
         repo_root,
-        max_step=total_target_max_steps if total_target_max_steps > 0 else None,
+        max_samples=total_target_global_samples if use_sample_progress else None,
+        min_samples_exclusive=None,
+        max_step=(None if use_sample_progress else (total_target_max_steps if total_target_max_steps > 0 else None)),
         min_step_exclusive=None,
         plan_id=plan_id,
     )
+    if latest_state is None and use_sample_progress:
+        # Backward compatibility for legacy states that don't contain sample metadata.
+        latest_state = _select_latest_state_candidate(
+            first_phase_config,
+            repo_root,
+            max_samples=None,
+            min_samples_exclusive=None,
+            max_step=total_target_max_steps if total_target_max_steps > 0 else None,
+            min_step_exclusive=None,
+            plan_id=plan_id,
+        )
     if latest_state is None:
         return {
             "start_pos": 0,
             "completed": False,
             "resume_state_dir": "",
             "resume_step": None,
+            "resume_samples": None,
             "intra_phase_resume": False,
             "apply_boundary_offset": False,
         }
 
     step_num = int(latest_state.get("step_num", -1))
+    sample_num = int(latest_state.get("sample_num", -1))
     state_dir = str(latest_state["path"])
 
-    if step_num < 0:
+    if use_sample_progress and sample_num >= 0:
+        progress_value = sample_num
+        target_key = "target_global_train_samples"
+    else:
+        progress_value = step_num
+        target_key = "target_max_train_steps"
+
+    if progress_value < 0:
         # Cannot map phase robustly without a step, but resume from this state is still safer than full restart.
         return {
             "start_pos": 0,
             "completed": False,
             "resume_state_dir": state_dir,
-            "resume_step": None,
+            "resume_step": int(step_num) if step_num >= 0 else None,
+            "resume_samples": int(sample_num) if sample_num >= 0 else None,
             "intra_phase_resume": True,
             "apply_boundary_offset": False,
         }
@@ -255,8 +307,8 @@ def _infer_resume_context(
     prev_target = 0
     start_pos = None
     for idx, phase in enumerate(phases):
-        target = int(phase.get("target_max_train_steps", 0) or 0)
-        if step_num < target:
+        target = int(phase.get(target_key, 0) or 0)
+        if progress_value < target:
             start_pos = idx
             break
         prev_target = target
@@ -268,6 +320,7 @@ def _infer_resume_context(
                 "completed": False,
                 "resume_state_dir": "",
                 "resume_step": step_num,
+                "resume_samples": sample_num if sample_num >= 0 else None,
                 "intra_phase_resume": False,
                 "apply_boundary_offset": False,
                 "ignore_existing_completed_state": True,
@@ -277,12 +330,13 @@ def _infer_resume_context(
             "completed": True,
             "resume_state_dir": state_dir,
             "resume_step": step_num,
+            "resume_samples": sample_num if sample_num >= 0 else None,
             "intra_phase_resume": False,
             "apply_boundary_offset": False,
         }
 
-    prev_target_for_start = int(phases[start_pos - 1].get("target_max_train_steps", 0) or 0) if start_pos > 0 else 0
-    intra_phase_resume = step_num > prev_target_for_start
+    prev_target_for_start = int(phases[start_pos - 1].get(target_key, 0) or 0) if start_pos > 0 else 0
+    intra_phase_resume = progress_value > prev_target_for_start
     apply_boundary_offset = bool(start_pos > 0 and not intra_phase_resume)
 
     return {
@@ -290,6 +344,7 @@ def _infer_resume_context(
         "completed": False,
         "resume_state_dir": state_dir,
         "resume_step": int(step_num),
+        "resume_samples": int(sample_num) if sample_num >= 0 else None,
         "intra_phase_resume": bool(intra_phase_resume),
         "apply_boundary_offset": bool(apply_boundary_offset),
     }
@@ -325,13 +380,13 @@ def _run_mixed_plan(plan: dict) -> int:
     )
     if resume_ctx.get("ignore_existing_completed_state"):
         log.info(
-            "[staged-resolution] found existing state at/over final target steps, "
+            "[staged-resolution] found existing state at/over final target progress, "
             "but no explicit resume is set. start from phase 1 as a fresh staged run."
         )
     start_pos = int(resume_ctx.get("start_pos", 0) or 0)
     if resume_ctx.get("completed"):
         log.info(
-            "[staged-resolution] detected existing state reaches or exceeds final target steps. "
+            "[staged-resolution] detected existing state reaches or exceeds final target progress. "
             "all phases are considered completed."
         )
         return 0
@@ -342,6 +397,7 @@ def _run_mixed_plan(plan: dict) -> int:
         log.info(
             f"[staged-resolution] restart detected: start_phase={start_pos + 1}, "
             f"resume_state={resume_ctx.get('resume_state_dir')}, resume_step={resume_ctx.get('resume_step')}, "
+            f"resume_samples={resume_ctx.get('resume_samples')}, "
             f"intra_phase_resume={'yes' if resume_ctx.get('intra_phase_resume') else 'no'}, "
             f"boundary_offset={'yes' if resume_ctx.get('apply_boundary_offset') else 'no'}"
         )
@@ -404,6 +460,7 @@ def _run_mixed_plan(plan: dict) -> int:
             f"epochs={phase.get('epochs')} "
             f"batches_per_epoch={phase.get('batches_per_epoch')} "
             f"phase_steps={phase.get('phase_steps')} target_max_steps={phase.get('target_max_train_steps')} "
+            f"target_global_samples={phase.get('target_global_train_samples')} "
             f"target_epoch_end={phase.get('target_epoch_end')}"
         )
         log.info(
@@ -424,15 +481,32 @@ def _run_mixed_plan(plan: dict) -> int:
             continue
 
         phase_config_after = _load_toml(phase_toml)
+        phase_target_global_samples = int(phase.get("target_global_train_samples", 0) or 0)
+        prev_phase_target_global_samples = (
+            int(phases[pos - 1].get("target_global_train_samples", 0) or 0) if pos > 0 else 0
+        )
+        use_sample_bounds = phase_target_global_samples > 0
         phase_target_max_steps = int(phase.get("target_max_train_steps", 0) or 0)
         prev_phase_target_max_steps = int(phases[pos - 1].get("target_max_train_steps", 0) or 0) if pos > 0 else 0
         latest_state = _select_latest_state_candidate(
             phase_config_after,
             repo_root,
-            max_step=phase_target_max_steps if phase_target_max_steps > 0 else None,
-            min_step_exclusive=prev_phase_target_max_steps if prev_phase_target_max_steps > 0 else 0,
+            max_samples=phase_target_global_samples if use_sample_bounds else None,
+            min_samples_exclusive=prev_phase_target_global_samples if (use_sample_bounds and prev_phase_target_global_samples > 0) else None,
+            max_step=(None if use_sample_bounds else (phase_target_max_steps if phase_target_max_steps > 0 else None)),
+            min_step_exclusive=(None if use_sample_bounds else (prev_phase_target_max_steps if prev_phase_target_max_steps > 0 else None)),
             plan_id=str(plan.get("plan_id", "") or "").strip() or None,
         )
+        if latest_state is None and use_sample_bounds:
+            latest_state = _select_latest_state_candidate(
+                phase_config_after,
+                repo_root,
+                max_samples=None,
+                min_samples_exclusive=None,
+                max_step=phase_target_max_steps if phase_target_max_steps > 0 else None,
+                min_step_exclusive=prev_phase_target_max_steps if prev_phase_target_max_steps > 0 else None,
+                plan_id=str(plan.get("plan_id", "") or "").strip() or None,
+            )
         if latest_state is None:
             log.error(
                 "[staged-resolution] cannot find latest state after phase "
@@ -444,6 +518,7 @@ def _run_mixed_plan(plan: dict) -> int:
         log.info(
             f"[staged-resolution] phase {phase_index} finished, "
             f"resume state={auto_resume_state_dir}, resume_step={latest_state.get('step_num')}, "
+            f"resume_samples={latest_state.get('sample_num')}, "
             "next phase will apply resume_epoch_offset=1"
         )
 
