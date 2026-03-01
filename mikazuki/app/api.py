@@ -292,51 +292,6 @@ async def create_toml_file(request: Request):
     return result
 
 
-@router.post("/probe_batch_size")
-async def probe_batch_size(request: Request):
-    try:
-        config: dict = json.loads((await request.body()).decode("utf-8"))
-    except json.JSONDecodeError:
-        return APIResponseFail(message="Invalid JSON payload")
-
-    if not isinstance(config, dict):
-        return APIResponseFail(message="Invalid payload type")
-
-    train_utils.fix_config_types(config)
-
-    gpu_ids = config.pop("gpu_ids", None)
-    model_train_type = str(config.get("model_train_type", "sd-lora") or "sd-lora")
-    trainer_file = trainer_mapping.get(model_train_type)
-    if trainer_file is None:
-        supported = ", ".join(sorted(trainer_mapping.keys()))
-        return APIResponseFail(message=f"不支持的训练类型: {model_train_type}。当前支持: {supported}")
-
-    train_data_dir = str(config.get("train_data_dir", "") or "").strip()
-    if not train_data_dir:
-        return APIResponseFail(message="缺少 train_data_dir")
-    if model_train_type != "sdxl-finetune" and not train_utils.validate_data_dir(train_data_dir):
-        return APIResponseFail(message="训练数据集路径不存在或没有图片，请检查目录。")
-
-    model_path = str(config.get("pretrained_model_name_or_path", "") or "").strip()
-    if not model_path:
-        return APIResponseFail(message="缺少 pretrained_model_name_or_path")
-    validated, message = train_utils.validate_model(model_path, model_train_type)
-    if not validated:
-        return APIResponseFail(message=message)
-
-    suggest_cpu_threads = 8 if len(train_utils.get_total_images(train_data_dir)) > 200 else 2
-    result = await asyncio.to_thread(
-        process.probe_recommended_batch_size,
-        config,
-        trainer_file,
-        gpu_ids=gpu_ids,
-        cpu_threads=suggest_cpu_threads,
-    )
-    if not result.get("ok"):
-        return APIResponseFail(message=result.get("message"), data=result.get("data"))
-    return APIResponseSuccess(message=result.get("message"), data=result.get("data"))
-
-
 @router.post("/staged_resolution_train_image_count")
 async def staged_resolution_train_image_count(request: Request):
     try:

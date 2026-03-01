@@ -5,7 +5,6 @@ import hashlib
 import json
 import math
 import os
-import platform
 import re
 import shlex
 import shutil
@@ -78,30 +77,6 @@ MIXED_RESOLUTION_SAMPLE_EPOCH_FACTORS = {
 }
 MIXED_RESOLUTION_RESUME_SENTINEL = "__MIXED_AUTO_RESUME__"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
-BATCH_PROBE_MAX_CANDIDATE = 512
-BATCH_PROBE_MAX_TRIALS = 7
-BATCH_PROBE_TIMEOUT_SECONDS = 600
-BATCH_PROBE_OOM_PATTERNS = [
-    re.compile(r"cuda out of memory", re.IGNORECASE),
-    re.compile(r"cudnn_status_alloc_failed", re.IGNORECASE),
-    re.compile(r"out of memory", re.IGNORECASE),
-    re.compile(r"allocator.*memory", re.IGNORECASE),
-]
-BATCH_PROBE_MODEL_MEMORY_PROFILE = {
-    # (base_overhead_mib, per_sample_mib_at_1024)
-    "sdxl_train_network.py": (2600.0, 1450.0),
-    "sdxl_train.py": (3200.0, 1800.0),
-    "train_network.py": (1700.0, 780.0),
-    "train_db.py": (2100.0, 980.0),
-}
-BATCH_PROBE_SHARED_MEM_DELTA_THRESHOLD_MIB = 256.0
-BATCH_PROBE_SHARED_MEM_ABS_THRESHOLD_MIB = 512.0
-BATCH_PROBE_PROCESS_DEDICATED_MIN_MIB = 1024.0
-BATCH_PROBE_NEW_PROCESS_MIN_DEDICATED_MIB = 512.0
-BATCH_PROBE_DEDICATED_NEAR_FULL_RATIO = 0.92
-BATCH_PROBE_DEDICATED_NEAR_FULL_FREE_MIB = 768.0
-BATCH_PROBE_MEMORY_SAMPLING_INTERVAL_SECONDS = 0.35
-BATCH_PROBE_SHARED_ADAPTER_DELTA_MIN_MIB = 256.0
 
 
 def _to_bool(value, default=False):
@@ -275,6 +250,39 @@ def _count_train_images_with_repeats(config: dict, repo_root: Path) -> int:
     return _count_images_recursive(train_root)
 
 
+def _resolve_per_device_batch_from_global(global_batch: int, world_size: int) -> Tuple[bool, int, str]:
+    ws = max(1, int(world_size))
+    gb = int(global_batch)
+    if gb <= 0:
+        return False, 0, "train_batch_size 必须大于 0"
+
+    if ws == 1:
+        return True, gb, ""
+
+    if gb < ws:
+        return (
+            False,
+            0,
+            f"为保持等效全局 batch 不变，train_batch_size(={gb}) 不能小于 world_size(={ws})。"
+            "请增大 batch 或减少并行卡数。",
+        )
+
+    if gb % ws != 0:
+        return (
+            False,
+            0,
+            f"为保持等效全局 batch 不变，train_batch_size(={gb}) 必须能被 world_size(={ws}) 整除。"
+            "请调整 batch 或并行卡数。",
+        )
+
+    return True, gb // ws, ""
+
+
+def _is_network_lora_trainer(trainer_file: str) -> bool:
+    trainer_name = Path(str(trainer_file)).name
+    return trainer_name in {"train_network.py", "sdxl_train_network.py"}
+
+
 def _build_mixed_resolution_plan(
     config: dict,
     toml_path: str,
@@ -309,12 +317,19 @@ def _build_mixed_resolution_plan(
     if base_epochs <= 0:
         return None, "启用阶段分辨率训练时，max_train_epochs 必须大于 0"
 
+    normalized_num_processes_for_epoch_calc = max(1, int(num_processes_for_epoch_calc))
+
     try:
-        base_batch = int(config.get("train_batch_size"))
+        base_global_batch = int(config.get("train_batch_size"))
     except Exception:
-        base_batch = 0
-    if base_batch <= 0:
+        base_global_batch = 0
+    if base_global_batch <= 0:
         return None, "启用阶段分辨率训练时，train_batch_size 必须大于 0"
+    ok_batch, base_per_device_batch, batch_error = _resolve_per_device_batch_from_global(
+        base_global_batch, normalized_num_processes_for_epoch_calc
+    )
+    if not ok_batch:
+        return None, f"启用阶段分辨率训练时批大小配置不合法: {batch_error}"
 
     try:
         base_gradient_accumulation_steps = int(config.get("gradient_accumulation_steps", 1) or 1)
@@ -350,13 +365,13 @@ def _build_mixed_resolution_plan(
         return None, ratio_error
     configured_ratio_sum_percent = sum(item[2] for item in configured_phases)
 
-    normalized_num_processes_for_epoch_calc = max(1, int(num_processes_for_epoch_calc))
-
     plan_signature_payload = {
         "trainer_name": trainer_name,
         "base_resolution": [base_side, base_side],
         "base_epochs": int(base_epochs),
-        "base_batch": int(base_batch),
+        "base_batch_global": int(base_global_batch),
+        "base_batch_per_device": int(base_per_device_batch),
+        "world_size": int(normalized_num_processes_for_epoch_calc),
         "base_gradient_accumulation_steps": int(base_gradient_accumulation_steps),
         "save_every_n_epochs": int(save_every_n_epochs),
         "use_sample_epoch_schedule": bool(use_sample_epoch_schedule),
@@ -386,12 +401,20 @@ def _build_mixed_resolution_plan(
     phase_configs = []
     cumulative_epochs = 0
     cumulative_steps = 0
-    cumulative_global_samples = 0
     previous_side = None
 
     for idx, (side, ratio, ratio_percent) in enumerate(configured_phases, start=1):
         target_pixels = side * side
-        batch_this_phase = max(1, int(math.floor(base_batch * (base_pixels / target_pixels))))
+        global_batch_this_phase = max(1, int(math.floor(base_global_batch * (base_pixels / target_pixels))))
+        ok_phase_batch, per_device_batch_this_phase, phase_batch_error = _resolve_per_device_batch_from_global(
+            global_batch_this_phase, normalized_num_processes_for_epoch_calc
+        )
+        if not ok_phase_batch:
+            return (
+                None,
+                f"阶段 {idx} ({side}x{side}) 批大小配置不合法: {phase_batch_error}"
+                f"（当前阶段全局 batch={global_batch_this_phase}）",
+            )
 
         sample_factor = float(MIXED_RESOLUTION_SAMPLE_EPOCH_FACTORS.get(side, base_pixels / target_pixels))
         # Keep gradient-accumulation semantics anchored to 1024 baseline:
@@ -412,27 +435,24 @@ def _build_mixed_resolution_plan(
             epoch_rounding_multiple = _lcm(epoch_rounding_multiple, sample_every_n_epochs_this_phase)
 
         effective_batch_ratio = (
-            (batch_this_phase * gradient_accumulation_steps_this_phase)
-            / (base_batch * base_gradient_accumulation_steps)
+            (global_batch_this_phase * gradient_accumulation_steps_this_phase)
+            / (base_global_batch * base_gradient_accumulation_steps)
         )
         # Raw formula: ceil(base_epochs * phase_ratio * (phase_effective_batch / base_effective_batch))
         raw_epochs_this_phase = int(math.ceil(base_epochs * ratio * effective_batch_ratio))
         # Actual formula: ceil_to_multiple(raw_epochs, lcm(save_every_n_epochs, sample_every_n_epochs_phase))
         epochs_this_phase = _ceil_to_multiple(max(1, raw_epochs_this_phase), epoch_rounding_multiple)
-        batches_per_epoch = max(1, int(math.ceil(global_epoch_train_images / batch_this_phase)))
+        batches_per_epoch = max(1, int(math.ceil(global_epoch_train_images / global_batch_this_phase)))
         steps_per_epoch = max(1, int(math.ceil(batches_per_epoch / gradient_accumulation_steps_this_phase)))
         steps_this_phase = int(epochs_this_phase * steps_per_epoch)
-        phase_target_global_samples = int(epochs_this_phase * global_epoch_train_images)
-
         cumulative_epochs += int(epochs_this_phase)
         cumulative_steps += int(steps_this_phase)
-        cumulative_global_samples += int(phase_target_global_samples)
 
         phase_toml_path = plan_base.with_name(f"{plan_base.stem}-staged-phase{idx}.toml")
         phase_config = copy.deepcopy(config)
         phase_config[MIXED_RESOLUTION_ENABLE_KEY] = False
         phase_config["resolution"] = f"{side},{side}"
-        phase_config["train_batch_size"] = int(batch_this_phase)
+        phase_config["train_batch_size"] = int(per_device_batch_this_phase)
         phase_config["gradient_accumulation_steps"] = int(gradient_accumulation_steps_this_phase)
         phase_config["max_train_steps"] = int(cumulative_steps)
         phase_config.pop("max_train_epochs", None)
@@ -441,8 +461,6 @@ def _build_mixed_resolution_plan(
         phase_config["staged_plan_id"] = plan_id
         phase_config["staged_phase_index"] = int(idx)
         phase_config["staged_phase_target_max_train_steps"] = int(cumulative_steps)
-        phase_config["staged_phase_target_global_samples"] = int(cumulative_global_samples)
-        phase_config["target_global_train_samples"] = int(cumulative_global_samples)
         phase_config["save_every_n_epochs"] = int(save_every_n_epochs_this_phase)
         if use_sample_epoch_schedule and sample_every_n_epochs_this_phase is not None:
             phase_config["sample_every_n_epochs"] = int(sample_every_n_epochs_this_phase)
@@ -456,8 +474,8 @@ def _build_mixed_resolution_plan(
 
         raw_formula = (
             f"ceil({base_epochs} * ({ratio_percent:g} / 100) * "
-            f"(({batch_this_phase}*{gradient_accumulation_steps_this_phase}) / "
-            f"({base_batch}*{base_gradient_accumulation_steps})))"
+            f"(({global_batch_this_phase}*{gradient_accumulation_steps_this_phase}) / "
+            f"({base_global_batch}*{base_gradient_accumulation_steps})))"
         )
         if use_sample_epoch_schedule and sample_every_n_epochs_this_phase is not None:
             actual_formula = (
@@ -489,10 +507,10 @@ def _build_mixed_resolution_plan(
                 "steps_per_epoch": int(steps_per_epoch),
                 "phase_steps": int(steps_this_phase),
                 "target_max_train_steps": int(cumulative_steps),
-                "phase_target_global_samples": int(phase_target_global_samples),
-                "target_global_train_samples": int(cumulative_global_samples),
                 "target_epoch_end": int(cumulative_epochs),
-                "batch_size": int(batch_this_phase),
+                "batch_size": int(global_batch_this_phase),
+                "batch_size_global": int(global_batch_this_phase),
+                "batch_size_per_device": int(per_device_batch_this_phase),
                 "gradient_accumulation_steps_factor": float(gradient_accumulation_factor),
                 "gradient_accumulation_steps": int(gradient_accumulation_steps_this_phase),
                 "save_every_n_epochs_factor": float(sample_factor),
@@ -523,16 +541,18 @@ def _build_mixed_resolution_plan(
         "sample_every_n_epochs_rule": "1024=x, 768=ceil(1.78x), 512=ceil(4x)",
         "save_every_n_epochs_rule": "1024=x, 768=ceil(1.78x), 512=ceil(4x)",
         "base_resolution": f"{base_side},{base_side}",
-        "base_batch_size": int(base_batch),
+        "base_batch_size": int(base_global_batch),
+        "base_batch_size_global": int(base_global_batch),
+        "base_batch_size_per_device": int(base_per_device_batch),
         "base_gradient_accumulation_steps": int(base_gradient_accumulation_steps),
         "base_epochs": int(base_epochs),
+        "world_size": int(normalized_num_processes_for_epoch_calc),
         "total_train_images_with_repeats": int(total_train_images),
         "num_processes_for_epoch_calc": int(normalized_num_processes_for_epoch_calc),
         "per_process_train_images_with_repeats": int(global_epoch_train_images),
         "global_epoch_train_images_with_repeats": int(global_epoch_train_images),
         "total_mixed_epochs": int(cumulative_epochs),
         "total_mixed_steps": int(cumulative_steps),
-        "total_target_global_samples": int(cumulative_global_samples),
         "gradient_accumulation_steps_rule": "x=1 -> all phases keep 1; x>1 -> all phases keep x (anchored to 1024 baseline)",
         "phases": phase_configs,
     }
@@ -1692,1319 +1712,6 @@ def _enforce_distributed_output_policy(toml_path: str, machine_rank: int) -> Tup
     return True, ""
 
 
-def _batch_probe_is_oom(log_text: str) -> bool:
-    if not log_text:
-        return False
-    return any(pattern.search(log_text) for pattern in BATCH_PROBE_OOM_PATTERNS)
-
-
-def _to_bool_from_config(config: dict, key: str, default=False) -> bool:
-    return _to_bool(config.get(key, default), default)
-
-
-def _is_wsl_platform() -> bool:
-    if sys.platform != "linux":
-        return False
-    if os.environ.get("WSL_INTEROP"):
-        return True
-    try:
-        version = Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
-        return "microsoft" in version or "wsl" in version
-    except Exception:
-        return False
-
-
-def _detect_runtime_environment_label() -> str:
-    if _is_wsl_platform():
-        return "wsl"
-    if sys.platform == "win32":
-        return "windows"
-    if sys.platform == "linux":
-        return "linux"
-    return "unknown"
-
-
-def _should_probe_shared_gpu_memory() -> bool:
-    return sys.platform == "win32" or _is_wsl_platform()
-
-
-def _to_mib_from_windows_counter(raw_value) -> Optional[float]:
-    try:
-        value = float(raw_value)
-    except Exception:
-        return None
-    if value < 0:
-        return None
-    # Win32_PerfFormattedData_GPUPerformanceCounters counters are in bytes.
-    return float(value / 1024.0 / 1024.0)
-
-
-def _extract_pid_from_gpu_counter_name(name: str) -> Optional[int]:
-    raw = str(name or "").strip()
-    if not raw:
-        return None
-
-    patterns = [
-        re.compile(r"(?:^|_)pid[_-]?(\d+)(?:_|$)", re.IGNORECASE),
-        re.compile(r"(?:^|_)pid(\d+)(?:_|$)", re.IGNORECASE),
-    ]
-    for pattern in patterns:
-        matched = pattern.search(raw)
-        if matched:
-            try:
-                return int(matched.group(1))
-            except Exception:
-                continue
-    return None
-
-
-def _query_windows_gpu_process_memory_mib() -> dict:
-    info = {
-        "ok": False,
-        "processes": {},
-        "error": "",
-        "raw_count": 0,
-    }
-    if not _should_probe_shared_gpu_memory():
-        info["error"] = "unsupported_platform"
-        return info
-
-    ps_exe = "powershell" if sys.platform == "win32" else "powershell.exe"
-    ps_script = (
-        "$ErrorActionPreference='Stop';"
-        "$items=Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory "
-        "| Where-Object { $_.Name -and $_.Name -notlike '*_Total' };"
-        "if(-not $items){'[]';exit 0};"
-        "$items|Select-Object Name,DedicatedUsage,SharedUsage,LocalUsage,NonLocalUsage|ConvertTo-Json -Compress"
-    )
-    try:
-        result = subprocess.run(
-            [ps_exe, "-NoProfile", "-Command", ps_script],
-            text=True,
-            capture_output=True,
-            timeout=6,
-            check=False,
-        )
-    except Exception as e:
-        info["error"] = str(e)
-        return info
-
-    if result.returncode != 0:
-        info["error"] = (result.stderr or result.stdout or "").strip()[:500]
-        return info
-
-    raw = (result.stdout or "").strip().lstrip("\ufeff")
-    if not raw:
-        info["error"] = "empty_powershell_output"
-        return info
-    try:
-        data = json.loads(raw)
-    except Exception as e:
-        info["error"] = f"json_parse_failed: {e}"
-        return info
-
-    rows = data if isinstance(data, list) else [data]
-    if not isinstance(rows, list):
-        info["error"] = "unexpected_payload_type"
-        return info
-
-    processes = {}
-    for item in rows:
-        if not isinstance(item, dict):
-            continue
-        pid = _extract_pid_from_gpu_counter_name(str(item.get("Name", "") or ""))
-        if pid is None:
-            continue
-
-        dedicated_mib = _to_mib_from_windows_counter(item.get("DedicatedUsage"))
-        if dedicated_mib is None:
-            dedicated_mib = _to_mib_from_windows_counter(item.get("LocalUsage"))
-        shared_mib = _to_mib_from_windows_counter(item.get("SharedUsage"))
-        if shared_mib is None:
-            shared_mib = _to_mib_from_windows_counter(item.get("NonLocalUsage"))
-
-        if dedicated_mib is None and shared_mib is None:
-            continue
-
-        existing = processes.get(pid)
-        ded_value = float(dedicated_mib or 0.0)
-        shared_value = float(shared_mib or 0.0)
-        if existing is None:
-            processes[pid] = {
-                "pid": int(pid),
-                "dedicated_mib": ded_value,
-                "shared_mib": shared_value,
-                "counter_name": str(item.get("Name", "") or ""),
-            }
-        else:
-            existing["dedicated_mib"] = max(float(existing.get("dedicated_mib", 0.0)), ded_value)
-            existing["shared_mib"] = max(float(existing.get("shared_mib", 0.0)), shared_value)
-
-    if not processes:
-        info["error"] = "no_process_rows_with_pid"
-        return info
-
-    info["ok"] = True
-    info["processes"] = processes
-    info["raw_count"] = len(rows)
-    return info
-
-
-def _query_windows_gpu_adapter_memory_mib() -> dict:
-    info = {
-        "ok": False,
-        "shared_mib": None,
-        "dedicated_mib": None,
-        "adapter_name": "",
-        "error": "",
-    }
-    if not _should_probe_shared_gpu_memory():
-        info["error"] = "unsupported_platform"
-        return info
-
-    ps_exe = "powershell" if sys.platform == "win32" else "powershell.exe"
-    ps_script = (
-        "$ErrorActionPreference='Stop';"
-        "$items=Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory "
-        "| Where-Object { $_.Name -notlike '*_Total' };"
-        "if(-not $items){'{}';exit 0};"
-        "$best=$items|Sort-Object -Property DedicatedUsage -Descending|Select-Object -First 1 Name,DedicatedUsage,SharedUsage;"
-        "$best|ConvertTo-Json -Compress"
-    )
-    try:
-        result = subprocess.run(
-            [ps_exe, "-NoProfile", "-Command", ps_script],
-            text=True,
-            capture_output=True,
-            timeout=6,
-            check=False,
-        )
-    except Exception as e:
-        info["error"] = str(e)
-        return info
-
-    if result.returncode != 0:
-        info["error"] = (result.stderr or result.stdout or "").strip()[:500]
-        return info
-
-    raw = (result.stdout or "").strip().lstrip("\ufeff")
-    if not raw:
-        info["error"] = "empty_powershell_output"
-        return info
-
-    try:
-        data = json.loads(raw)
-    except Exception as e:
-        info["error"] = f"json_parse_failed: {e}"
-        return info
-
-    if isinstance(data, list):
-        if not data:
-            info["error"] = "no_adapter_rows"
-            return info
-        data = data[0]
-    if not isinstance(data, dict):
-        info["error"] = "unexpected_payload_type"
-        return info
-
-    shared_mib = _to_mib_from_windows_counter(data.get("SharedUsage"))
-    dedicated_mib = _to_mib_from_windows_counter(data.get("DedicatedUsage"))
-    if shared_mib is None and dedicated_mib is None:
-        info["error"] = "counter_values_unavailable"
-        return info
-
-    info.update(
-        {
-            "ok": True,
-            "shared_mib": float(shared_mib or 0.0),
-            "dedicated_mib": float(dedicated_mib or 0.0),
-            "adapter_name": str(data.get("Name", "") or ""),
-        }
-    )
-    return info
-
-
-def _query_gpu_compute_process_memory_mib(gpu_ids: Optional[list] = None) -> dict:
-    info = {
-        "ok": False,
-        "processes": {},
-        "error": "",
-    }
-    cmd = ["nvidia-smi"]
-    if gpu_ids:
-        try:
-            cmd.extend(["-i", str(int(gpu_ids[0]))])
-        except Exception:
-            pass
-    cmd.extend(
-        [
-            "--query-compute-apps=pid,process_name,used_gpu_memory",
-            "--format=csv,noheader,nounits",
-        ]
-    )
-    try:
-        result = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=8)
-    except Exception as e:
-        info["error"] = str(e)
-        return info
-
-    if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        if "no running processes found" in stderr.lower():
-            info["ok"] = True
-            return info
-        info["error"] = stderr[:500]
-        return info
-
-    rows = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
-    processes = {}
-    for line in rows:
-        if "no running processes found" in line.lower():
-            continue
-        parts = [x.strip() for x in line.split(",")]
-        if len(parts) < 2:
-            continue
-        try:
-            pid = int(parts[0])
-        except Exception:
-            continue
-
-        if len(parts) == 2:
-            proc_name = ""
-            used_raw = parts[1]
-        else:
-            proc_name = ",".join(parts[1:-1]).strip()
-            used_raw = parts[-1]
-
-        dedicated_known = True
-        try:
-            dedicated_mib = float(used_raw)
-            if not math.isfinite(dedicated_mib) or dedicated_mib < 0:
-                dedicated_known = False
-                dedicated_mib = None
-        except Exception:
-            dedicated_known = False
-            dedicated_mib = None
-
-        existing = processes.get(pid)
-        if existing is None:
-            processes[pid] = {
-                "pid": int(pid),
-                "process_name": proc_name,
-                "dedicated_mib": (float(dedicated_mib) if dedicated_mib is not None else None),
-                "dedicated_known": bool(dedicated_known),
-                "dedicated_raw": str(used_raw),
-            }
-        else:
-            if dedicated_mib is not None:
-                prev = existing.get("dedicated_mib")
-                if prev is None:
-                    existing["dedicated_mib"] = float(dedicated_mib)
-                else:
-                    existing["dedicated_mib"] = max(float(prev), float(dedicated_mib))
-                existing["dedicated_known"] = True
-            else:
-                existing["dedicated_known"] = bool(existing.get("dedicated_known", False))
-                existing["dedicated_raw"] = str(existing.get("dedicated_raw", "") or str(used_raw))
-
-    info["ok"] = True
-    info["processes"] = processes
-    return info
-
-
-def _is_dedicated_vram_near_full(total_mib, used_mib) -> bool:
-    try:
-        total = float(total_mib)
-        used = float(used_mib)
-    except Exception:
-        return False
-
-    if not math.isfinite(total) or not math.isfinite(used):
-        return False
-    if total <= 0 or used <= 0:
-        return False
-
-    free_mib = max(0.0, total - used)
-    if used / total >= BATCH_PROBE_DEDICATED_NEAR_FULL_RATIO:
-        return True
-    if free_mib <= BATCH_PROBE_DEDICATED_NEAR_FULL_FREE_MIB:
-        return True
-    return False
-
-
-def _query_gpu_memory_info(gpu_ids: Optional[list] = None) -> dict:
-    info = {
-        "ok": False,
-        "index": None,
-        "name": "",
-        "total_mib": None,
-        "used_mib": None,
-        "free_mib": None,
-        "error": "",
-    }
-    try:
-        cmd = [
-            "nvidia-smi",
-            "--query-gpu=index,name,memory.total,memory.used",
-            "--format=csv,noheader,nounits",
-        ]
-        result = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=8)
-        if result.returncode != 0:
-            info["error"] = (result.stderr or result.stdout or "").strip()[:500]
-            return info
-        lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
-        if not lines:
-            info["error"] = "nvidia-smi returned no gpu rows"
-            return info
-
-        rows = []
-        for line in lines:
-            parts = [x.strip() for x in line.split(",")]
-            if len(parts) < 4:
-                continue
-            try:
-                rows.append(
-                    {
-                        "index": int(parts[0]),
-                        "name": parts[1],
-                        "total_mib": int(parts[2]),
-                        "used_mib": int(parts[3]),
-                    }
-                )
-            except Exception:
-                continue
-        if not rows:
-            info["error"] = "failed to parse nvidia-smi output"
-            return info
-
-        preferred_index = None
-        if gpu_ids:
-            try:
-                preferred_index = int(gpu_ids[0])
-            except Exception:
-                preferred_index = None
-
-        selected = None
-        if preferred_index is not None:
-            for row in rows:
-                if row["index"] == preferred_index:
-                    selected = row
-                    break
-        if selected is None:
-            selected = rows[0]
-
-        free_mib = max(0, int(selected["total_mib"]) - int(selected["used_mib"]))
-        info.update(
-            {
-                "ok": True,
-                "index": int(selected["index"]),
-                "name": str(selected["name"]),
-                "total_mib": int(selected["total_mib"]),
-                "used_mib": int(selected["used_mib"]),
-                "free_mib": int(free_mib),
-            }
-        )
-        return info
-    except Exception as e:
-        info["error"] = str(e)
-        return info
-
-
-def _estimate_batch_probe_range(
-    probe_base_config: dict,
-    trainer_file: str,
-    *,
-    start_batch: int,
-    hard_cap: int,
-    gpu_ids: Optional[list] = None,
-) -> dict:
-    memory = _query_gpu_memory_info(gpu_ids=gpu_ids)
-    resolution = _parse_resolution_pair(str(probe_base_config.get("resolution", "") or ""))
-    if not memory.get("ok") or resolution is None:
-        return {
-            "ok": False,
-            "range_low": 1,
-            "range_high": int(max(1, min(hard_cap, start_batch))),
-            "suggested_start_batch": int(max(1, min(hard_cap, start_batch))),
-            "search_hard_cap": int(max(1, hard_cap)),
-            "memory": memory,
-            "reason": "gpu_memory_or_resolution_unavailable",
-        }
-
-    trainer_name = Path(str(trainer_file)).name
-    base_overhead_mib, per_sample_1024_mib = BATCH_PROBE_MODEL_MEMORY_PROFILE.get(
-        trainer_name, (2200.0, 1100.0)
-    )
-    width, height = resolution
-    area_factor = max(0.1, float(width * height) / float(1024 * 1024))
-    per_sample_mib = float(per_sample_1024_mib) * area_factor
-    overhead_mib = float(base_overhead_mib)
-
-    if not _to_bool_from_config(probe_base_config, "gradient_checkpointing", False):
-        per_sample_mib *= 1.25
-        overhead_mib *= 1.08
-    if str(probe_base_config.get("mixed_precision", "fp16") or "fp16").strip().lower() == "no":
-        per_sample_mib *= 1.18
-    if not _to_bool_from_config(probe_base_config, "cache_latents", True):
-        per_sample_mib *= 1.08
-    if not _to_bool_from_config(probe_base_config, "cache_text_encoder_outputs", True):
-        per_sample_mib *= 1.05
-
-    total_mib = int(memory.get("total_mib") or 0)
-    free_now_mib = int(memory.get("free_mib") or 0)
-
-    if total_mib <= 10 * 1024:
-        util = 0.78
-        reserve_mib = 1000
-    elif total_mib <= 12 * 1024:
-        util = 0.82
-        reserve_mib = 1200
-    elif total_mib <= 16 * 1024:
-        util = 0.86
-        reserve_mib = 1400
-    else:
-        util = 0.90
-        reserve_mib = 1800
-
-    budget_by_total = int(total_mib * util)
-    budget_by_current_free = int(free_now_mib * 0.95)
-    usable_budget = max(256, min(budget_by_total, budget_by_current_free) - reserve_mib)
-    effective_budget = max(0.0, float(usable_budget) - float(overhead_mib))
-
-    estimated_high = int(math.floor(effective_budget / max(1.0, per_sample_mib)))
-    estimated_high = max(1, min(int(hard_cap), estimated_high))
-    estimated_low = max(1, int(math.floor(estimated_high * 0.55)))
-
-    # Keep search wide enough for estimation bias while still reducing probe time.
-    search_hard_cap = min(int(hard_cap), max(int(start_batch), estimated_high + 2, int(math.ceil(estimated_high * 1.5))))
-    suggested_start = int(start_batch)
-    if suggested_start < estimated_low:
-        suggested_start = estimated_low
-    if suggested_start > estimated_high:
-        suggested_start = estimated_high
-    if suggested_start > search_hard_cap:
-        suggested_start = search_hard_cap
-
-    return {
-        "ok": True,
-        "range_low": int(estimated_low),
-        "range_high": int(estimated_high),
-        "suggested_start_batch": int(max(1, suggested_start)),
-        "search_hard_cap": int(max(1, search_hard_cap)),
-        "memory": memory,
-        "assumptions": {
-            "trainer": trainer_name,
-            "resolution": [int(width), int(height)],
-            "area_factor": float(round(area_factor, 4)),
-            "per_sample_mib": float(round(per_sample_mib, 2)),
-            "overhead_mib": float(round(overhead_mib, 2)),
-            "usable_budget_mib": int(usable_budget),
-        },
-    }
-
-
-def _compute_batch_probe_safe_recommendation(best_batch: int, gpu_memory: dict) -> int:
-    best_batch = max(1, int(best_batch))
-    if best_batch <= 1:
-        return 1
-
-    total_mib = int(gpu_memory.get("total_mib") or 0)
-    # Keep stronger headroom on 8~10GB cards where fluctuations are common.
-    if total_mib > 0 and total_mib <= 10 * 1024:
-        return max(1, best_batch - 1)
-    if total_mib > 0 and total_mib <= 16 * 1024:
-        if best_batch <= 3:
-            return max(1, best_batch - 1)
-        return max(1, int(math.floor(best_batch * 0.85)))
-
-    return max(1, int(math.floor(best_batch * 0.9)))
-
-
-def _batch_probe_tail(log_text: str, *, max_lines: int = 60, max_chars: int = 4000) -> str:
-    if not log_text:
-        return ""
-    lines = log_text.splitlines()
-    tail = "\n".join(lines[-max_lines:])
-    if len(tail) > max_chars:
-        tail = tail[-max_chars:]
-    return tail
-
-
-def _prepare_batch_probe_base_config(config: dict, trainer_file: str) -> Tuple[Optional[dict], str]:
-    probe_config = copy.deepcopy(config)
-
-    pretrained_model = str(probe_config.get("pretrained_model_name_or_path", "") or "").strip()
-    if not pretrained_model:
-        return None, "缺少底模路径（pretrained_model_name_or_path）"
-
-    train_data_dir = str(probe_config.get("train_data_dir", "") or "").strip()
-    if not train_data_dir:
-        return None, "缺少训练数据集路径（train_data_dir）"
-
-    resolution_raw = str(probe_config.get("resolution", "") or "").strip()
-    if _parse_resolution_pair(resolution_raw) is None:
-        return None, f"训练分辨率无效：{resolution_raw}"
-
-    try:
-        base_batch = int(probe_config.get("train_batch_size", 1))
-    except Exception:
-        base_batch = 1
-    if base_batch <= 0:
-        base_batch = 1
-
-    trainer_name = Path(str(trainer_file)).name
-    if trainer_name in {"train_network.py", "sdxl_train_network.py"}:
-        if not str(probe_config.get("network_module", "") or "").strip():
-            probe_config["network_module"] = "networks.lora"
-        if probe_config.get("network_dim") in (None, ""):
-            probe_config["network_dim"] = 32
-        if probe_config.get("network_alpha") in (None, ""):
-            probe_config["network_alpha"] = 32
-
-    probe_config["train_batch_size"] = int(base_batch)
-    probe_config[MIXED_RESOLUTION_ENABLE_KEY] = False
-    probe_config["max_data_loader_n_workers"] = 0
-    probe_config["persistent_data_loader_workers"] = False
-
-    # Keep the real training path but force it to a single short step.
-    probe_config["max_train_steps"] = 1
-    probe_config.pop("max_train_epochs", None)
-    probe_config.pop("resume", None)
-
-    # Disable periodic save/sample; final model save by trainer is cleaned after trial.
-    probe_config["save_every_n_epochs"] = 10**9
-    probe_config.pop("save_every_n_steps", None)
-    probe_config["save_state"] = False
-    probe_config["save_state_on_train_end"] = False
-    probe_config.pop("save_last_n_epochs_state", None)
-    probe_config.pop("save_last_n_steps_state", None)
-    probe_config.pop("save_last_n_epochs", None)
-    probe_config.pop("save_last_n_steps", None)
-    probe_config["enable_preview"] = False
-    probe_config.pop("sample_prompts", None)
-    probe_config.pop("sample_every_n_epochs", None)
-    probe_config.pop("sample_sampler", None)
-
-    # Avoid external tracker failures in probe mode.
-    if str(probe_config.get("log_with", "") or "").strip().lower() == "wandb":
-        probe_config["log_with"] = "tensorboard"
-    probe_config.pop("wandb_api_key", None)
-
-    return probe_config, ""
-
-
-def _run_single_batch_probe(
-    probe_base_config: dict,
-    trainer_file: str,
-    *,
-    batch_size: int,
-    trial_index: int,
-    gpu_ids: Optional[list] = None,
-    cpu_threads: int = 2,
-) -> dict:
-    repo_root = base_dir_path()
-    trial_root = (Path("/tmp") / "mikazuki-batch-probe" / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / f"trial-{trial_index:02d}-b{batch_size}").resolve()
-    output_dir = trial_root / "output"
-    logging_dir = trial_root / "logs"
-    toml_path = trial_root / "probe.toml"
-
-    trial_root.mkdir(parents=True, exist_ok=True)
-
-    probe_config = copy.deepcopy(probe_base_config)
-    probe_config["train_batch_size"] = int(batch_size)
-    probe_config["output_dir"] = str(output_dir)
-    probe_config["logging_dir"] = str(logging_dir)
-    probe_config["output_name"] = f"batch-probe-b{batch_size}"
-
-    with open(toml_path, "w", encoding="utf-8") as f:
-        f.write(toml.dumps(probe_config))
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "accelerate.commands.launch",
-        "--num_cpu_threads_per_process",
-        str(max(1, int(cpu_threads))),
-        "--quiet",
-        str(trainer_file),
-        "--config_file",
-        str(toml_path),
-    ]
-
-    env = os.environ.copy()
-    env["ACCELERATE_DISABLE_RICH"] = "1"
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONWARNINGS"] = "ignore::FutureWarning,ignore::UserWarning"
-    if gpu_ids:
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
-
-    started_at = time.time()
-    output_text = ""
-    status = "error"
-    reason = ""
-    return_code = -1
-    runtime_env_label = _detect_runtime_environment_label()
-    runtime_platform = platform.platform()
-    runtime_machine = platform.machine()
-    runtime_python = platform.python_version()
-
-    def _fmt_mib(value) -> str:
-        if value is None:
-            return "n/a"
-        try:
-            return f"{float(value):.1f}MiB"
-        except Exception:
-            return str(value)
-
-    shared_probe_enabled = _should_probe_shared_gpu_memory()
-    shared_mem_probe = {}
-    shared_mem_baseline_mib = None
-    shared_mem_post_mib = None
-    shared_mem_delta_mib = None
-    probe_shared_peak_mib = None
-    probe_shared_delta_peak_mib = None
-    probe_dedicated_peak_mib = None
-    probe_dedicated_peak_from_device_delta_mib = None
-    probe_device_used_peak_mib = None
-    probe_device_total_mib = None
-    probe_device_used_baseline_mib = None
-    probe_dedicated_near_full = False
-    probe_attribution_mode = "none"
-    tracked_probe_pids = set()
-    probe_has_unknown_dedicated = False
-    adapter_shared_baseline_mib = None
-    adapter_shared_peak_mib = None
-    adapter_shared_delta_peak_mib = None
-
-    log.info(
-        "[batch-probe] trial=%s batch=%s start env=%s sys_platform=%s os=%s machine=%s py=%s trainer=%s resolution=%s gpu_ids=%s",
-        trial_index,
-        int(batch_size),
-        runtime_env_label,
-        sys.platform,
-        runtime_platform,
-        runtime_machine,
-        runtime_python,
-        str(Path(trainer_file).name),
-        str(probe_config.get("resolution", "")),
-        ",".join(map(str, gpu_ids)) if gpu_ids else "auto",
-    )
-    log.info(
-        "[batch-probe] trial=%s config grad_ckpt=%s mixed_precision=%s cache_latents=%s cache_text=%s",
-        trial_index,
-        str(probe_config.get("gradient_checkpointing", "")),
-        str(probe_config.get("mixed_precision", "")),
-        str(probe_config.get("cache_latents", "")),
-        str(probe_config.get("cache_text_encoder_outputs", "")),
-    )
-
-    baseline_gpu_memory = _query_gpu_memory_info(gpu_ids=gpu_ids)
-    if baseline_gpu_memory.get("ok"):
-        probe_device_total_mib = float(baseline_gpu_memory.get("total_mib") or 0.0)
-        probe_device_used_peak_mib = float(baseline_gpu_memory.get("used_mib") or 0.0)
-        probe_device_used_baseline_mib = float(baseline_gpu_memory.get("used_mib") or 0.0)
-        log.info(
-            "[batch-probe] trial=%s baseline gpu=%s(%s) used=%s total=%s free=%s",
-            trial_index,
-            str(baseline_gpu_memory.get("name", "")),
-            str(baseline_gpu_memory.get("index", "")),
-            _fmt_mib(baseline_gpu_memory.get("used_mib")),
-            _fmt_mib(baseline_gpu_memory.get("total_mib")),
-            _fmt_mib(baseline_gpu_memory.get("free_mib")),
-        )
-    else:
-        log.info(
-            "[batch-probe] trial=%s baseline gpu query failed: %s",
-            trial_index,
-            str(baseline_gpu_memory.get("error", "")),
-        )
-
-    baseline_compute_memory = _query_gpu_compute_process_memory_mib(gpu_ids=gpu_ids)
-    baseline_compute_map = baseline_compute_memory.get("processes", {}) if baseline_compute_memory.get("ok") else {}
-
-    baseline_shared_process_memory = {
-        "ok": False,
-        "processes": {},
-        "error": "disabled",
-    }
-    baseline_shared_map = {}
-    if shared_probe_enabled:
-        baseline_shared_process_memory = _query_windows_gpu_process_memory_mib()
-        if baseline_shared_process_memory.get("ok"):
-            baseline_shared_map = baseline_shared_process_memory.get("processes", {})
-        baseline_adapter_memory = _query_windows_gpu_adapter_memory_mib()
-        if baseline_adapter_memory.get("ok"):
-            adapter_shared_baseline_mib = float(baseline_adapter_memory.get("shared_mib") or 0.0)
-            adapter_shared_peak_mib = float(adapter_shared_baseline_mib)
-
-    def _sample_probe_memory(launcher_pid: int):
-        nonlocal probe_device_total_mib
-        nonlocal probe_device_used_peak_mib
-        nonlocal probe_dedicated_peak_mib
-        nonlocal probe_shared_peak_mib
-        nonlocal probe_shared_delta_peak_mib
-        nonlocal probe_attribution_mode
-        nonlocal probe_has_unknown_dedicated
-        nonlocal adapter_shared_peak_mib
-        nonlocal adapter_shared_delta_peak_mib
-
-        device_memory = _query_gpu_memory_info(gpu_ids=gpu_ids)
-        if device_memory.get("ok"):
-            used_mib = float(device_memory.get("used_mib") or 0.0)
-            total_mib = float(device_memory.get("total_mib") or 0.0)
-            if probe_device_total_mib is None:
-                probe_device_total_mib = total_mib
-            if probe_device_used_peak_mib is None:
-                probe_device_used_peak_mib = used_mib
-            else:
-                probe_device_used_peak_mib = max(probe_device_used_peak_mib, used_mib)
-
-        compute_memory = _query_gpu_compute_process_memory_mib(gpu_ids=gpu_ids)
-        current_compute_map = compute_memory.get("processes", {}) if compute_memory.get("ok") else {}
-
-        candidate_pids = set()
-        if launcher_pid in current_compute_map:
-            candidate_pids.add(int(launcher_pid))
-
-        if baseline_compute_memory.get("ok"):
-            for pid, item in current_compute_map.items():
-                if pid in baseline_compute_map:
-                    continue
-                dedicated_known = bool(item.get("dedicated_known", True))
-                dedicated_mib_raw = item.get("dedicated_mib")
-                dedicated_mib = float(dedicated_mib_raw or 0.0) if dedicated_mib_raw is not None else 0.0
-                if (not dedicated_known) or dedicated_mib >= BATCH_PROBE_NEW_PROCESS_MIN_DEDICATED_MIB:
-                    candidate_pids.add(int(pid))
-
-        if candidate_pids:
-            tracked_probe_pids.update(candidate_pids)
-            if probe_attribution_mode == "none":
-                probe_attribution_mode = "nvidia-compute"
-
-        if tracked_probe_pids and current_compute_map:
-            dedicated_now = 0.0
-            has_known_dedicated_sample = False
-            for pid in tracked_probe_pids:
-                item = current_compute_map.get(pid)
-                if item is None:
-                    continue
-                dedicated_known = bool(item.get("dedicated_known", True))
-                dedicated_mib_raw = item.get("dedicated_mib")
-                if dedicated_known and dedicated_mib_raw is not None:
-                    has_known_dedicated_sample = True
-                    dedicated_now += max(0.0, float(dedicated_mib_raw))
-                else:
-                    probe_has_unknown_dedicated = True
-            if has_known_dedicated_sample:
-                if probe_dedicated_peak_mib is None:
-                    probe_dedicated_peak_mib = dedicated_now
-                else:
-                    probe_dedicated_peak_mib = max(probe_dedicated_peak_mib, dedicated_now)
-
-        if not shared_probe_enabled:
-            return
-
-        adapter_memory = _query_windows_gpu_adapter_memory_mib()
-        if adapter_memory.get("ok"):
-            adapter_shared_now = float(adapter_memory.get("shared_mib") or 0.0)
-            if adapter_shared_peak_mib is None:
-                adapter_shared_peak_mib = adapter_shared_now
-            else:
-                adapter_shared_peak_mib = max(adapter_shared_peak_mib, adapter_shared_now)
-
-            if adapter_shared_baseline_mib is not None:
-                adapter_delta_now = max(0.0, adapter_shared_now - adapter_shared_baseline_mib)
-                if adapter_shared_delta_peak_mib is None:
-                    adapter_shared_delta_peak_mib = adapter_delta_now
-                else:
-                    adapter_shared_delta_peak_mib = max(adapter_shared_delta_peak_mib, adapter_delta_now)
-
-        shared_process_memory = _query_windows_gpu_process_memory_mib()
-        if not shared_process_memory.get("ok"):
-            return
-        current_shared_map = shared_process_memory.get("processes", {})
-
-        if not tracked_probe_pids and launcher_pid in current_shared_map:
-            tracked_probe_pids.add(int(launcher_pid))
-            if probe_attribution_mode == "none":
-                probe_attribution_mode = "launcher-fallback"
-        if not tracked_probe_pids and baseline_shared_process_memory.get("ok"):
-            for pid, item in current_shared_map.items():
-                if pid in baseline_shared_map:
-                    continue
-                dedicated_mib = float(item.get("dedicated_mib") or 0.0)
-                if dedicated_mib >= BATCH_PROBE_NEW_PROCESS_MIN_DEDICATED_MIB:
-                    tracked_probe_pids.add(int(pid))
-            if tracked_probe_pids and probe_attribution_mode == "none":
-                probe_attribution_mode = "counter-delta-fallback"
-        if not tracked_probe_pids:
-            return
-
-        shared_now = 0.0
-        baseline_shared = 0.0
-        for pid in tracked_probe_pids:
-            current_item = current_shared_map.get(pid)
-            if current_item is not None:
-                shared_now += max(0.0, float(current_item.get("shared_mib") or 0.0))
-            baseline_item = baseline_shared_map.get(pid)
-            if baseline_item is not None:
-                baseline_shared += max(0.0, float(baseline_item.get("shared_mib") or 0.0))
-
-        delta_shared = max(0.0, shared_now - baseline_shared)
-        if probe_shared_peak_mib is None:
-            probe_shared_peak_mib = shared_now
-        else:
-            probe_shared_peak_mib = max(probe_shared_peak_mib, shared_now)
-        if probe_shared_delta_peak_mib is None:
-            probe_shared_delta_peak_mib = delta_shared
-        else:
-            probe_shared_delta_peak_mib = max(probe_shared_delta_peak_mib, delta_shared)
-
-    process = None
-    try:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(repo_root),
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        launcher_pid = int(process.pid)
-        deadline = started_at + BATCH_PROBE_TIMEOUT_SECONDS
-
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-                stdout_text, stderr_text = process.communicate(timeout=5)
-                output_text = (stdout_text or "") + "\n" + (stderr_text or "")
-                return_code = int(process.returncode or -1)
-                status = "timeout"
-                reason = f"timeout>{BATCH_PROBE_TIMEOUT_SECONDS}s"
-                log.info("[batch-probe] trial=%s timeout reached, process killed", trial_index)
-                break
-
-            try:
-                stdout_text, stderr_text = process.communicate(
-                    timeout=max(0.05, min(BATCH_PROBE_MEMORY_SAMPLING_INTERVAL_SECONDS, remaining))
-                )
-                output_text = (stdout_text or "") + "\n" + (stderr_text or "")
-                return_code = int(process.returncode or 0)
-                if return_code == 0:
-                    status = "success"
-                    reason = "ok"
-                elif _batch_probe_is_oom(output_text):
-                    status = "oom"
-                    reason = "oom"
-                else:
-                    status = "error"
-                    reason = f"non-oom error (code={return_code})"
-                log.info(
-                    "[batch-probe] trial=%s process exited code=%s status=%s",
-                    trial_index,
-                    return_code,
-                    status,
-                )
-                break
-            except subprocess.TimeoutExpired:
-                _sample_probe_memory(launcher_pid)
-
-        _sample_probe_memory(launcher_pid)
-    except Exception as e:
-        if process is not None:
-            try:
-                process.kill()
-            except Exception:
-                pass
-        status = "error"
-        reason = f"probe exception: {e}"
-    finally:
-        try:
-            shutil.rmtree(trial_root, ignore_errors=True)
-        except Exception:
-            pass
-
-    tracked_probe_pids_list = sorted(int(pid) for pid in tracked_probe_pids)
-    shared_metrics_source = "none"
-    use_process_shared_metrics = bool(tracked_probe_pids_list and probe_shared_peak_mib is not None)
-    if use_process_shared_metrics:
-        process_shared_baseline = float(
-            sum(max(0.0, float((baseline_shared_map.get(pid) or {}).get("shared_mib") or 0.0)) for pid in tracked_probe_pids_list)
-        )
-        process_shared_post = float(max(0.0, probe_shared_peak_mib))
-        process_shared_delta = float(
-            max(0.0, probe_shared_delta_peak_mib or (process_shared_post - process_shared_baseline))
-        )
-        adapter_delta_for_switch = None
-        if adapter_shared_peak_mib is not None and adapter_shared_baseline_mib is not None:
-            adapter_delta_for_switch = float(
-                max(
-                    0.0,
-                    adapter_shared_delta_peak_mib
-                    if adapter_shared_delta_peak_mib is not None
-                    else (adapter_shared_peak_mib - adapter_shared_baseline_mib),
-                )
-            )
-        if (
-            adapter_delta_for_switch is not None
-            and process_shared_delta < 1.0
-            and process_shared_post < 1.0
-            and adapter_delta_for_switch >= BATCH_PROBE_SHARED_ADAPTER_DELTA_MIN_MIB
-        ):
-            use_process_shared_metrics = False
-        else:
-            shared_mem_baseline_mib = process_shared_baseline
-            shared_mem_post_mib = process_shared_post
-            shared_mem_delta_mib = process_shared_delta
-            shared_metrics_source = "process"
-
-    if not use_process_shared_metrics and tracked_probe_pids_list and adapter_shared_peak_mib is not None and adapter_shared_baseline_mib is not None:
-        # WSL may expose Linux compute PIDs but Windows-side shared-memory counters use host PIDs.
-        # In that case, use adapter shared-memory delta as fallback only when probe PIDs are known.
-        shared_mem_baseline_mib = float(max(0.0, adapter_shared_baseline_mib))
-        shared_mem_post_mib = float(max(0.0, adapter_shared_peak_mib))
-        shared_mem_delta_mib = float(
-            max(
-                0.0,
-                adapter_shared_delta_peak_mib
-                if adapter_shared_delta_peak_mib is not None
-                else (shared_mem_post_mib - shared_mem_baseline_mib),
-            )
-        )
-        shared_metrics_source = "adapter_fallback"
-
-    if probe_device_used_peak_mib is not None and probe_device_used_baseline_mib is not None:
-        probe_dedicated_peak_from_device_delta_mib = float(
-            max(0.0, probe_device_used_peak_mib - probe_device_used_baseline_mib)
-        )
-
-    probe_dedicated_near_full = _is_dedicated_vram_near_full(probe_device_total_mib, probe_device_used_peak_mib)
-    probe_shared_triggered = (
-        shared_mem_post_mib is not None
-        and shared_mem_delta_mib is not None
-        and (
-            shared_mem_post_mib >= BATCH_PROBE_SHARED_MEM_ABS_THRESHOLD_MIB
-            or shared_mem_delta_mib >= BATCH_PROBE_SHARED_MEM_DELTA_THRESHOLD_MIB
-        )
-    )
-    probe_dedicated_significant = False
-    if probe_dedicated_peak_mib is not None:
-        probe_dedicated_significant = probe_dedicated_peak_mib >= BATCH_PROBE_PROCESS_DEDICATED_MIN_MIB
-    elif probe_has_unknown_dedicated and probe_dedicated_peak_from_device_delta_mib is not None:
-        probe_dedicated_significant = probe_dedicated_peak_from_device_delta_mib >= BATCH_PROBE_PROCESS_DEDICATED_MIN_MIB
-
-    probe_shared_attributed = bool(tracked_probe_pids_list)
-
-    if (
-        status == "success"
-        and probe_shared_attributed
-        and probe_shared_triggered
-        and probe_dedicated_significant
-        and probe_dedicated_near_full
-    ):
-        status = "shared_mem"
-        reason = (
-            "probe_shared_gpu_memory_detected"
-            f"(baseline={shared_mem_baseline_mib:.1f}MiB,post={shared_mem_post_mib:.1f}MiB,"
-            f"delta={shared_mem_delta_mib:.1f}MiB,probe_dedicated_peak={float(probe_dedicated_peak_mib or 0.0):.1f}MiB,"
-            f"gpu_peak={float(probe_device_used_peak_mib or 0.0):.1f}/{float(probe_device_total_mib or 0.0):.1f}MiB)"
-        )
-
-    shared_mem_probe = {
-        "enabled": bool(shared_probe_enabled),
-        "process_counter_ok": bool(baseline_shared_process_memory.get("ok")) if shared_probe_enabled else False,
-        "process_counter_error": str(baseline_shared_process_memory.get("error", "")) if shared_probe_enabled else "disabled",
-        "compute_counter_ok": bool(baseline_compute_memory.get("ok")),
-        "compute_counter_error": str(baseline_compute_memory.get("error", "")),
-        "attribution_mode": probe_attribution_mode,
-        "shared_metrics_source": shared_metrics_source,
-        "tracked_pids": tracked_probe_pids_list,
-        "shared_peak_mib": probe_shared_peak_mib,
-        "shared_delta_peak_mib": probe_shared_delta_peak_mib,
-        "adapter_shared_baseline_mib": adapter_shared_baseline_mib,
-        "adapter_shared_peak_mib": adapter_shared_peak_mib,
-        "adapter_shared_delta_peak_mib": adapter_shared_delta_peak_mib,
-        "probe_dedicated_peak_mib": probe_dedicated_peak_mib,
-        "probe_dedicated_peak_from_device_delta_mib": probe_dedicated_peak_from_device_delta_mib,
-        "probe_has_unknown_dedicated": bool(probe_has_unknown_dedicated),
-        "device_used_peak_mib": probe_device_used_peak_mib,
-        "device_used_baseline_mib": probe_device_used_baseline_mib,
-        "device_total_mib": probe_device_total_mib,
-        "dedicated_near_full": bool(probe_dedicated_near_full),
-        "shared_triggered": bool(probe_shared_triggered),
-    }
-
-    return {
-        "batch_size": int(batch_size),
-        "status": status,
-        "reason": reason,
-        "return_code": int(return_code),
-        "elapsed_sec": round(max(0.0, time.time() - started_at), 3),
-        "log_tail": _batch_probe_tail(output_text),
-        "shared_memory_baseline_mib": shared_mem_baseline_mib,
-        "shared_memory_post_mib": shared_mem_post_mib,
-        "shared_memory_delta_mib": shared_mem_delta_mib,
-        "shared_memory_probe": shared_mem_probe or {},
-        "probe_dedicated_peak_mib": probe_dedicated_peak_mib,
-        "probe_dedicated_peak_from_device_delta_mib": probe_dedicated_peak_from_device_delta_mib,
-        "probe_has_unknown_dedicated": bool(probe_has_unknown_dedicated),
-        "probe_device_used_peak_mib": probe_device_used_peak_mib,
-        "probe_device_used_baseline_mib": probe_device_used_baseline_mib,
-        "probe_device_total_mib": probe_device_total_mib,
-        "probe_dedicated_near_full": bool(probe_dedicated_near_full),
-        "probe_shared_attributed": bool(probe_shared_attributed),
-        "probe_attribution_mode": probe_attribution_mode,
-        "probe_shared_metrics_source": shared_metrics_source,
-        "probe_tracked_pids": tracked_probe_pids_list,
-    }
-
-
-def probe_recommended_batch_size(
-    config: dict,
-    trainer_file: str,
-    *,
-    gpu_ids: Optional[list] = None,
-    cpu_threads: int = 2,
-    max_trials: int = BATCH_PROBE_MAX_TRIALS,
-    hard_cap: int = BATCH_PROBE_MAX_CANDIDATE,
-) -> dict:
-    probe_base_config, prep_error = _prepare_batch_probe_base_config(config, trainer_file)
-    if probe_base_config is None:
-        return {"ok": False, "message": prep_error, "data": {"trials": []}}
-
-    runtime_env_label = _detect_runtime_environment_label()
-    log.info(
-        "[batch-probe] environment detected: env=%s sys_platform=%s kernel=%s shared_probe_enabled=%s",
-        runtime_env_label,
-        sys.platform,
-        platform.platform(),
-        _should_probe_shared_gpu_memory(),
-    )
-
-    try:
-        start_batch = int(probe_base_config.get("train_batch_size", 1))
-    except Exception:
-        start_batch = 1
-    start_batch = max(1, start_batch)
-    hard_cap = max(start_batch, int(hard_cap))
-    max_trials = max(1, int(max_trials))
-
-    estimate = _estimate_batch_probe_range(
-        probe_base_config,
-        trainer_file,
-        start_batch=start_batch,
-        hard_cap=hard_cap,
-        gpu_ids=gpu_ids,
-    )
-    if estimate.get("ok"):
-        start_batch = int(estimate.get("suggested_start_batch", start_batch) or start_batch)
-        hard_cap = int(max(start_batch, estimate.get("search_hard_cap", hard_cap) or hard_cap))
-        # With memory estimation available, cap trial count for faster response.
-        max_trials = min(max_trials, 5)
-
-    trials = []
-    trial_index = 0
-
-    def run_candidate(candidate_batch: int) -> dict:
-        nonlocal trial_index
-        trial_index += 1
-        result = _run_single_batch_probe(
-            probe_base_config,
-            trainer_file,
-            batch_size=int(candidate_batch),
-            trial_index=trial_index,
-            gpu_ids=gpu_ids,
-            cpu_threads=cpu_threads,
-        )
-        trials.append(result)
-        log.info(
-            "[batch-probe] trial=%s batch=%s status=%s reason=%s elapsed=%.3fs",
-            trial_index,
-            result["batch_size"],
-            result["status"],
-            result["reason"],
-            result["elapsed_sec"],
-        )
-        return result
-
-    first = run_candidate(start_batch)
-    if first["status"] == "timeout":
-        return {
-            "ok": False,
-            "message": "batch 检测超时，请检查模型/数据路径或减少复杂配置后重试。",
-            "data": {
-                "trials": trials,
-                "start_batch_size": start_batch,
-                "resolution": str(probe_base_config.get("resolution", "")),
-                "estimated_range": {
-                    "low": int(estimate.get("range_low", 1) or 1),
-                    "high": int(estimate.get("range_high", 1) or 1),
-                },
-                "gpu_memory": estimate.get("memory", {}),
-            },
-        }
-    if first["status"] == "error":
-        return {
-            "ok": False,
-            "message": "batch 检测失败（非显存错误），请先修复当前训练配置。",
-            "data": {
-                "trials": trials,
-                "start_batch_size": start_batch,
-                "resolution": str(probe_base_config.get("resolution", "")),
-                "estimated_range": {
-                    "low": int(estimate.get("range_low", 1) or 1),
-                    "high": int(estimate.get("range_high", 1) or 1),
-                },
-                "gpu_memory": estimate.get("memory", {}),
-            },
-        }
-
-    best_batch = 0
-    if first["status"] == "oom":
-        est_low = int(estimate.get("range_low", 1) or 1)
-        est_high = int(estimate.get("range_high", start_batch - 1) or (start_batch - 1))
-        low = max(1, min(start_batch - 1, est_low))
-        high = max(low, min(start_batch - 1, est_high))
-        if low > high:
-            low, high = 1, max(1, start_batch - 1)
-        while low <= high and trial_index < max_trials:
-            mid = (low + high) // 2
-            result = run_candidate(mid)
-            if result["status"] == "success":
-                best_batch = mid
-                low = mid + 1
-            elif result["status"] in {"oom", "shared_mem"}:
-                high = mid - 1
-            else:
-                return {
-                    "ok": False,
-                    "message": "batch 检测中遇到非显存错误，已中止。",
-                    "data": {
-                        "trials": trials,
-                        "start_batch_size": start_batch,
-                        "resolution": str(probe_base_config.get("resolution", "")),
-                        "estimated_range": {
-                            "low": int(estimate.get("range_low", 1) or 1),
-                            "high": int(estimate.get("range_high", 1) or 1),
-                        },
-                        "gpu_memory": estimate.get("memory", {}),
-                    },
-                }
-    else:
-        best_batch = start_batch
-        failure_batch = None
-        current = start_batch
-
-        while trial_index < max_trials and current < hard_cap:
-            next_batch = min(hard_cap, max(current + 1, current * 2))
-            if next_batch <= current:
-                break
-            result = run_candidate(next_batch)
-            if result["status"] == "success":
-                best_batch = next_batch
-                current = next_batch
-                continue
-            if result["status"] in {"oom", "shared_mem"}:
-                failure_batch = next_batch
-                break
-            return {
-                "ok": False,
-                "message": "batch 检测中遇到非显存错误，已中止。",
-                "data": {
-                    "trials": trials,
-                    "start_batch_size": start_batch,
-                    "resolution": str(probe_base_config.get("resolution", "")),
-                    "estimated_range": {
-                        "low": int(estimate.get("range_low", 1) or 1),
-                        "high": int(estimate.get("range_high", 1) or 1),
-                    },
-                    "gpu_memory": estimate.get("memory", {}),
-                },
-            }
-
-        if failure_batch is not None and trial_index < max_trials:
-            low = best_batch + 1
-            high = failure_batch - 1
-            while low <= high and trial_index < max_trials:
-                mid = (low + high) // 2
-                result = run_candidate(mid)
-                if result["status"] == "success":
-                    best_batch = mid
-                    low = mid + 1
-                elif result["status"] in {"oom", "shared_mem"}:
-                    high = mid - 1
-                else:
-                    return {
-                        "ok": False,
-                        "message": "batch 检测中遇到非显存错误，已中止。",
-                        "data": {
-                            "trials": trials,
-                            "start_batch_size": start_batch,
-                            "resolution": str(probe_base_config.get("resolution", "")),
-                            "estimated_range": {
-                                "low": int(estimate.get("range_low", 1) or 1),
-                                "high": int(estimate.get("range_high", 1) or 1),
-                            },
-                            "gpu_memory": estimate.get("memory", {}),
-                        },
-                    }
-
-    if best_batch <= 0:
-        return {
-            "ok": False,
-            "message": "batch 检测失败：batch_size=1 仍触发显存不足或配置错误。",
-            "data": {
-                "trials": trials,
-                "start_batch_size": start_batch,
-                "resolution": str(probe_base_config.get("resolution", "")),
-                "estimated_range": {
-                    "low": int(estimate.get("range_low", 1) or 1),
-                    "high": int(estimate.get("range_high", 1) or 1),
-                },
-                "gpu_memory": estimate.get("memory", {}),
-            },
-        }
-
-    recommended_batch = _compute_batch_probe_safe_recommendation(
-        best_batch=best_batch,
-        gpu_memory=estimate.get("memory", {}),
-    )
-    has_shared_mem_hits = any((trial.get("status") == "shared_mem") for trial in trials)
-    shared_mem_hit_count = sum(1 for trial in trials if trial.get("status") == "shared_mem")
-    shared_mem_suffix = ""
-    if has_shared_mem_hits:
-        shared_mem_suffix = f"（检测到进程级共享显存命中 {shared_mem_hit_count} 次，且独显接近满载，已按效率安全策略降档）"
-
-    return {
-        "ok": True,
-        "message": (
-            f"检测完成：推荐 batch_size={recommended_batch} "
-            f"(最大稳定 batch={best_batch}，已自动预留安全余量){shared_mem_suffix}"
-        ),
-        "data": {
-            "recommended_batch_size": int(recommended_batch),
-            "max_stable_batch_size": int(best_batch),
-            "has_shared_memory_hits": bool(has_shared_mem_hits),
-            "shared_memory_hit_count": int(shared_mem_hit_count),
-            "start_batch_size": int(start_batch),
-            "resolution": str(probe_base_config.get("resolution", "")),
-            "max_trials": int(max_trials),
-            "hard_cap": int(hard_cap),
-            "estimated_range": {
-                "low": int(estimate.get("range_low", 1) or 1),
-                "high": int(estimate.get("range_high", 1) or 1),
-            },
-            "gpu_memory": estimate.get("memory", {}),
-            "estimate_assumptions": estimate.get("assumptions", {}),
-            "trials": trials,
-        },
-    }
-
-
 def run_train(toml_path: str,
               trainer_file: str = "./scripts/train_network.py",
               gpu_ids: Optional[list] = None,
@@ -3197,6 +1904,34 @@ def run_train(toml_path: str,
         )
         trainer_file = resolved_trainer_file
 
+    world_size_for_batch = max(1, int(total_num_processes))
+    staged_resolution_enabled = bool(
+        runtime_train_config and _to_bool(runtime_train_config.get(MIXED_RESOLUTION_ENABLE_KEY), False)
+    )
+    launch_train_batch_override = None
+
+    if runtime_train_config:
+        configured_global_batch = _to_int(runtime_train_config.get("train_batch_size", 1), 1)
+        ok_batch, per_device_batch, batch_error = _resolve_per_device_batch_from_global(
+            configured_global_batch, world_size_for_batch
+        )
+        if not ok_batch:
+            return APIResponse(status="error", message=f"训练批大小配置错误: {batch_error}")
+        launch_train_batch_override = int(per_device_batch)
+
+        grad_accum_steps = _to_int(runtime_train_config.get("gradient_accumulation_steps", 1), 1)
+        if grad_accum_steps <= 0:
+            grad_accum_steps = 1
+        world_effective_batch = int(configured_global_batch) * int(grad_accum_steps)
+        log.info(
+            "[batch-semantics] user_global_batch=%s world_size=%s per_device_batch=%s grad_accum=%s world_effective_batch=%s",
+            int(configured_global_batch),
+            int(world_size_for_batch),
+            int(per_device_batch),
+            int(grad_accum_steps),
+            int(world_effective_batch),
+        )
+
     if runtime_train_config:
         guard_ok, guard_message = _validate_resume_launch_guard(runtime_train_config, repo_root)
         if not guard_ok:
@@ -3238,12 +1973,12 @@ def run_train(toml_path: str,
 
     args = None
     mixed_resolution_plan = None
-    if runtime_train_config and _to_bool(runtime_train_config.get(MIXED_RESOLUTION_ENABLE_KEY), False):
+    if staged_resolution_enabled:
         mixed_resolution_plan, mixed_plan_error = _build_mixed_resolution_plan(
             runtime_train_config,
             toml_path,
             trainer_file,
-            num_processes_for_epoch_calc=total_num_processes,
+            num_processes_for_epoch_calc=world_size_for_batch,
         )
         if mixed_plan_error:
             return APIResponse(status="error", message=f"阶段分辨率训练配置错误: {mixed_plan_error}")
@@ -3260,7 +1995,9 @@ def run_train(toml_path: str,
             log.info(
                 "[staged-resolution] enabled: "
                 f"base={mixed_resolution_plan['base_resolution']}, "
-                f"base_batch={mixed_resolution_plan['base_batch_size']}, "
+                f"world_size={mixed_resolution_plan.get('world_size')}, "
+                f"base_batch_global={mixed_resolution_plan.get('base_batch_size_global', mixed_resolution_plan.get('base_batch_size'))}, "
+                f"base_batch_per_device={mixed_resolution_plan.get('base_batch_size_per_device', mixed_resolution_plan.get('base_batch_size'))}, "
                 f"base_grad_accum={mixed_resolution_plan.get('base_gradient_accumulation_steps')}, "
                 f"base_epochs={mixed_resolution_plan['base_epochs']}, "
                 f"ratio_sum_percent={mixed_resolution_plan.get('configured_ratio_sum_percent')}, "
@@ -3273,14 +2010,15 @@ def run_train(toml_path: str,
             )
             for phase in mixed_resolution_plan["phases"]:
                 log.info(
-                    "[staged-resolution] phase %s: res=%s ratio_percent=%s batch=%s grad_accum=%s "
+                    "[staged-resolution] phase %s: res=%s ratio_percent=%s batch_global=%s batch_per_device=%s grad_accum=%s "
                     "save_every_n_epochs=%s sample_every_n_epochs=%s "
                     "raw_epochs=%s epochs=%s rounding_multiple=%s batches/epoch=%s steps/epoch=%s "
-                    "phase_steps=%s target_max_steps=%s target_global_samples=%s target_epoch_end=%s cache_rebuild=%s toml=%s",
+                    "phase_steps=%s target_max_steps=%s target_epoch_end=%s cache_rebuild=%s toml=%s",
                     phase["phase_index"],
                     phase["resolution"],
                     phase.get("ratio_percent"),
-                    phase["batch_size"],
+                    phase.get("batch_size_global", phase.get("batch_size")),
+                    phase.get("batch_size_per_device", phase.get("batch_size")),
                     phase.get("gradient_accumulation_steps"),
                     phase.get("save_every_n_epochs"),
                     phase.get("sample_every_n_epochs"),
@@ -3291,18 +2029,10 @@ def run_train(toml_path: str,
                     phase["steps_per_epoch"],
                     phase["phase_steps"],
                     phase["target_max_train_steps"],
-                    phase.get("target_global_train_samples"),
                     phase["target_epoch_end"],
                     "yes" if phase["clear_cache_before_start"] else "no",
                     phase["toml_path"],
                 )
-                log.info(
-                    "[staged-resolution] phase %s formulas: raw='%s', actual='%s'",
-                    phase["phase_index"],
-                    phase.get("raw_epochs_formula"),
-                    phase.get("actual_epochs_formula"),
-                )
-
             args = [
                 sys.executable,
                 "-m",
@@ -3312,11 +2042,15 @@ def run_train(toml_path: str,
             ]
 
     if args is None:
+        launch_cli_overrides = []
+        if launch_train_batch_override is not None:
+            launch_cli_overrides += ["--train_batch_size", str(int(launch_train_batch_override))]
+
         args = list(base_accelerate_args) + list(launch_args) + [
             trainer_file,
             "--config_file",
             toml_path,
-        ]
+        ] + launch_cli_overrides
 
     if not (task := tm.create_task(args, customize_env)):
         return APIResponse(status="error", message="Failed to create task / 无法创建训练任务")

@@ -402,6 +402,12 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       var cb = item.querySelector("input[type='checkbox']");
       if (cb) return cb;
     }
+    if (!preferCheckbox) {
+      var textarea = item.querySelector("textarea");
+      if (textarea) return textarea;
+      var select = item.querySelector("select");
+      if (select) return select;
+    }
     var inputs = item.querySelectorAll("input");
     for (var i = 0; i < inputs.length; i++) {
       var input = inputs[i];
@@ -625,13 +631,50 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     return { ok: true, ratios: ratios, total: total };
   }
 
-  function buildPhasePreview(baseBatch, baseGradAccum, baseEpochs, saveEveryEpochs, baseSampleEveryEpochs, previewEnabled, phaseRatioPercents, totalTrainImages, numProcesses) {
+  function buildPhasePreview(
+    baseBatchGlobal,
+    baseGradAccum,
+    baseEpochs,
+    saveEveryEpochs,
+    baseSampleEveryEpochs,
+    useSampleEpochSchedule,
+    phaseRatioPercents,
+    totalTrainImages,
+    worldSize
+  ) {
     var rows = [];
     var totalEpochs = 0;
+    var totalSteps = 0;
+    var totalTargetSamples = 0;
     var safeTrainImages = Math.max(0, toInt(totalTrainImages, 0));
-    var safeNumProcesses = Math.max(1, toInt(numProcesses, 1));
+    var safeWorldSize = Math.max(1, toInt(worldSize, 1));
     var hasOversizedBatchPhase = false;
-    var totalLoopEpochs = 0;
+    var canComputeSteps = safeTrainImages > 0;
+
+    if (baseBatchGlobal < safeWorldSize) {
+      return {
+        ok: false,
+        message:
+          "train_batch_size(=" +
+          baseBatchGlobal +
+          ") 不能小于 world_size(=" +
+          safeWorldSize +
+          ")。"
+      };
+    }
+    if (baseBatchGlobal % safeWorldSize !== 0) {
+      return {
+        ok: false,
+        message:
+          "train_batch_size(=" +
+          baseBatchGlobal +
+          ") 需要能被 world_size(=" +
+          safeWorldSize +
+          ") 整除。"
+      };
+    }
+
+    var baseBatchPerDevice = Math.floor(baseBatchGlobal / safeWorldSize);
     for (var i = 0; i < PHASES.length; i++) {
       var phase = PHASES[i];
       var side = phase.side;
@@ -639,17 +682,46 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       if (!Number.isFinite(ratioPercent)) ratioPercent = phase.defaultRatioPercent;
       if (ratioPercent < 0) ratioPercent = 0;
       if (ratioPercent > 100) ratioPercent = 100;
+
       var ratio = ratioPercent / 100.0;
-      var phaseBatch = Math.max(1, Math.floor(baseBatch * (1024 * 1024) / (side * side)));
+      var phaseBatchGlobal = Math.max(1, Math.floor(baseBatchGlobal * (1024 * 1024) / (side * side)));
+      if (phaseBatchGlobal < safeWorldSize) {
+        return {
+          ok: false,
+          message:
+            side +
+            " 阶段全局 batch(=" +
+            phaseBatchGlobal +
+            ") 小于 world_size(=" +
+            safeWorldSize +
+            ")，请调大 1024 基准 batch。"
+        };
+      }
+      if (phaseBatchGlobal % safeWorldSize !== 0) {
+        return {
+          ok: false,
+          message:
+            side +
+            " 阶段全局 batch(=" +
+            phaseBatchGlobal +
+            ") 不能被 world_size(=" +
+            safeWorldSize +
+            ") 整除，请调整 1024 基准 batch 或并行规模。"
+        };
+      }
+
+      var phaseBatchPerDevice = Math.floor(phaseBatchGlobal / safeWorldSize);
       var phaseGradAccum = baseGradAccum <= 1 ? 1 : baseGradAccum;
-      var effectiveBatchRatio = (phaseBatch * phaseGradAccum) / (baseBatch * baseGradAccum);
+      var effectiveBatchRatio = (phaseBatchGlobal * phaseGradAccum) / (baseBatchGlobal * baseGradAccum);
       var rawEpochs = Math.ceil(baseEpochs * ratio * effectiveBatchRatio);
       var phaseSaveEveryEpochs = Math.max(1, Math.ceil(saveEveryEpochs * phase.sampleScale));
-      var phaseSampleEveryEpochs = Math.max(1, Math.ceil(baseSampleEveryEpochs * phase.sampleScale));
-      var epochRoundBase = phaseSaveEveryEpochs;
-      if (previewEnabled) {
-        epochRoundBase = lcmInt(phaseSaveEveryEpochs, phaseSampleEveryEpochs);
-      }
+      var phaseSampleEveryEpochs = useSampleEpochSchedule
+        ? Math.max(1, Math.ceil(baseSampleEveryEpochs * phase.sampleScale))
+        : null;
+      var epochRoundBase = useSampleEpochSchedule
+        ? lcmInt(phaseSaveEveryEpochs, phaseSampleEveryEpochs)
+        : phaseSaveEveryEpochs;
+
       var phaseEpochs = 0;
       if (ratioPercent > 0) {
         phaseEpochs = Math.max(1, ceilToMultiple(rawEpochs, epochRoundBase));
@@ -658,27 +730,29 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
 
       var batchesPerEpoch = null;
       var stepsPerEpoch = null;
+      var phaseSteps = null;
+      var targetMaxTrainSteps = null;
       var phaseTargetSamples = null;
-      var phaseGlobalBatch = null;
-      var phaseLoopEpochs = null;
-      var loopEpochEquivalent = null;
-      if (safeTrainImages > 0 && phaseEpochs > 0) {
-        batchesPerEpoch = Math.max(1, Math.ceil(safeTrainImages / phaseBatch));
+      var targetGlobalSamples = null;
+      if (canComputeSteps && phaseEpochs > 0) {
+        batchesPerEpoch = Math.max(1, Math.ceil(safeTrainImages / phaseBatchGlobal));
         stepsPerEpoch = Math.max(1, Math.ceil(batchesPerEpoch / phaseGradAccum));
+        phaseSteps = phaseEpochs * stepsPerEpoch;
         phaseTargetSamples = phaseEpochs * safeTrainImages;
-        phaseGlobalBatch = phaseBatch * phaseGradAccum * safeNumProcesses;
-        var phaseTargetSteps = Math.max(1, Math.ceil(phaseTargetSamples / Math.max(1, phaseGlobalBatch)));
-        phaseLoopEpochs = Math.max(1, Math.ceil(phaseTargetSteps / Math.max(1, stepsPerEpoch)));
-        loopEpochEquivalent = (stepsPerEpoch * phaseGlobalBatch) / safeTrainImages;
-        totalLoopEpochs += phaseLoopEpochs;
-        if (phaseBatch > safeTrainImages) {
+        totalSteps += phaseSteps;
+        totalTargetSamples += phaseTargetSamples;
+        targetMaxTrainSteps = totalSteps;
+        targetGlobalSamples = totalTargetSamples;
+        if (phaseBatchGlobal > safeTrainImages) {
           hasOversizedBatchPhase = true;
         }
       }
+
       rows.push({
         side: side,
         ratioPercent: ratioPercent,
-        batch: phaseBatch,
+        batchGlobal: phaseBatchGlobal,
+        batchPerDevice: phaseBatchPerDevice,
         gradAccum: phaseGradAccum,
         effectiveBatchRatio: effectiveBatchRatio,
         saveEveryEpochs: phaseSaveEveryEpochs,
@@ -686,32 +760,52 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
         sampleScale: phase.sampleScale,
         rawEpochs: rawEpochs,
         epochs: phaseEpochs,
-        loopEpochs: phaseLoopEpochs,
-        phaseTargetSamples: phaseTargetSamples,
-        globalBatch: phaseGlobalBatch,
+        epochRoundBase: epochRoundBase,
         batchesPerEpoch: batchesPerEpoch,
         stepsPerEpoch: stepsPerEpoch,
-        loopEpochEquivalent: loopEpochEquivalent,
-        epochRoundBase: epochRoundBase,
-        rawFormula: "ceil(" + baseEpochs + " * (" + ratioPercent + " / 100) * ((" + phaseBatch + "*" + phaseGradAccum + ") / (" + baseBatch + "*" + baseGradAccum + ")))",
-        actualFormula: ratioPercent > 0
-          ? (previewEnabled
+        phaseSteps: phaseSteps,
+        targetMaxTrainSteps: targetMaxTrainSteps,
+        phaseTargetSamples: phaseTargetSamples,
+        targetGlobalSamples: targetGlobalSamples,
+        targetEpochEnd: totalEpochs,
+        rawFormula:
+          "ceil(" +
+          baseEpochs +
+          " * (" +
+          ratioPercent +
+          " / 100) * ((" +
+          phaseBatchGlobal +
+          "*" +
+          phaseGradAccum +
+          ") / (" +
+          baseBatchGlobal +
+          "*" +
+          baseGradAccum +
+          ")))",
+        actualFormula:
+          ratioPercent > 0
+            ? useSampleEpochSchedule
               ? "ceil_to_multiple(raw, lcm(save=" + phaseSaveEveryEpochs + ", sample=" + phaseSampleEveryEpochs + ")=" + epochRoundBase + ")"
-              : "ceil_to_multiple(raw, save=" + phaseSaveEveryEpochs + ")")
-          : "ratio=0 -> skipped"
+              : "ceil_to_multiple(raw, save=" + phaseSaveEveryEpochs + ")"
+            : "ratio=0 -> skipped"
       });
     }
+
     return {
+      ok: true,
       rows: rows,
       totalEpochs: totalEpochs,
-      previewEnabled: !!previewEnabled,
+      totalSteps: canComputeSteps ? totalSteps : null,
+      totalTargetSamples: canComputeSteps ? totalTargetSamples : null,
+      useSampleEpochSchedule: !!useSampleEpochSchedule,
       baseGradAccum: baseGradAccum,
       saveEveryEpochs: saveEveryEpochs,
       baseSampleEveryEpochs: baseSampleEveryEpochs,
       ratioSumPercent: rows.reduce(function (acc, row) { return acc + row.ratioPercent; }, 0),
       totalTrainImages: safeTrainImages,
-      numProcesses: safeNumProcesses,
-      totalLoopEpochs: totalLoopEpochs,
+      worldSize: safeWorldSize,
+      baseBatchGlobal: baseBatchGlobal,
+      baseBatchPerDevice: baseBatchPerDevice,
       hasOversizedBatchPhase: hasOversizedBatchPhase
     };
   }
@@ -720,41 +814,47 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     var html = "";
     html += '<div class="stage-title">阶段分辨率预览（启用后将按以下计划训练）</div>';
     html += "<table>";
-    html += "<thead><tr><th>分辨率</th><th>占比(%)</th><th>Batch</th><th>梯度累加步数</th><th>CKPT 每 N Epoch</th><th>Sample 每 N Epoch</th><th>Raw Epoch</th><th>等效 Epoch(样本口径)</th><th>Loop Epoch(训练器口径)</th><th>取整基数</th></tr></thead><tbody>";
+    html += "<thead><tr><th>分辨率</th><th>占比(%)</th><th>Batch(全局)</th><th>Batch(每卡)</th><th>梯度累加</th><th>CKPT 每 N Epoch</th><th>Sample 每 N Epoch</th><th>Raw Epoch</th><th>实际 Epoch</th><th>steps/epoch</th><th>phase_steps</th><th>target_max_steps(累计)</th><th>target_epoch_end(累计)</th></tr></thead><tbody>";
     for (var i = 0; i < preview.rows.length; i++) {
       var row = preview.rows[i];
       html += "<tr>";
       html += "<td>" + row.side + "x" + row.side + "</td>";
       html += "<td>" + row.ratioPercent + "</td>";
-      html += "<td>" + row.batch + "</td>";
-      html += "<td>" + row.gradAccum + "（与1024基准一致）</td>";
+      html += "<td>" + row.batchGlobal + "</td>";
+      html += "<td>" + row.batchPerDevice + "</td>";
+      html += "<td>" + row.gradAccum + "</td>";
       html += "<td>" + row.saveEveryEpochs + " (x" + row.sampleScale + ")</td>";
-      html += "<td>" + row.sampleEveryEpochs + " (x" + row.sampleScale + ")</td>";
+      html += "<td>" + (row.sampleEveryEpochs == null ? "-" : (row.sampleEveryEpochs + " (x" + row.sampleScale + ")")) + "</td>";
       html += "<td>" + row.rawEpochs + "</td>";
       html += "<td>" + row.epochs + "</td>";
-      html += "<td>" + (row.loopEpochs == null ? "-" : row.loopEpochs) + "</td>";
-      html += "<td>" + row.epochRoundBase + "</td>";
+      html += "<td>" + (row.stepsPerEpoch == null ? "-" : row.stepsPerEpoch) + "</td>";
+      html += "<td>" + (row.phaseSteps == null ? "-" : row.phaseSteps) + "</td>";
+      html += "<td>" + (row.targetMaxTrainSteps == null ? "-" : row.targetMaxTrainSteps) + "</td>";
+      html += "<td>" + row.targetEpochEnd + "</td>";
       html += "</tr>";
     }
     html += "</tbody></table>";
     html += '<div class="stage-note">总等效 Epoch（阶段累计）: ' + preview.totalEpochs + "；占比总和: " + preview.ratioSumPercent + "%（要求 ≤ 100%）</div>";
     if (preview.totalTrainImages > 0) {
-      html += '<div class="stage-note">数据集样本数（含 repeats）: ' + preview.totalTrainImages + "；num_processes: " + preview.numProcesses + "；总 Loop Epoch 估算: " + preview.totalLoopEpochs + "</div>";
+      html += '<div class="stage-note">数据集样本数（含 repeats）: ' + preview.totalTrainImages + "；world_size: " + preview.worldSize + "；基准 batch: 全局 " + preview.baseBatchGlobal + " / 每卡 " + preview.baseBatchPerDevice + "</div>";
+      html += '<div class="stage-note">总 steps（阶段累计）: ' + preview.totalSteps + "</div>";
     } else {
-      html += '<div class="stage-note">未拿到数据集样本数，Loop Epoch 暂无法精确估算（可正常训练，不影响后端真实计算）。</div>';
+      html += '<div class="stage-note">未拿到数据集样本数，steps 暂无法精确估算（不影响后端真实计算）。</div>';
     }
     html += '<div class="stage-note">Raw 公式: raw_epoch = ceil(base_epoch * phase_ratio * ((phase_batch*phase_grad_accum) / (base_batch*base_grad_accum)))</div>';
+    html += '<div class="stage-note">Batch 语义: train_batch_size 按“全局 batch”解释；每卡 batch = 全局 batch / world_size（需整除）</div>';
     html += '<div class="stage-note">梯度累加规则: x=1 时全阶段保持 1；x>1 时全阶段保持 x（以 1024 基准为准），当前 x=' + preview.baseGradAccum + "</div>";
-    if (preview.previewEnabled) {
+    if (preview.useSampleEpochSchedule) {
       html += '<div class="stage-note">实际公式: actual_epoch = ceil_to_multiple(raw_epoch, lcm(phase_save_every_n_epochs, phase_sample_every_n_epochs))</div>';
     } else {
-      html += '<div class="stage-note">实际公式: actual_epoch = ceil_to_multiple(raw_epoch, phase_save_every_n_epochs)（当前未启用训练预览图）</div>';
+      html += '<div class="stage-note">实际公式: actual_epoch = ceil_to_multiple(raw_epoch, phase_save_every_n_epochs)（sample 调度未生效）</div>';
     }
     if (preview.hasOversizedBatchPhase) {
-      html += '<div class="stage-note">注意：存在 phase_batch > 数据集样本数。DataLoader 会重复采样补满 batch，不会留空位，因此 Loop Epoch 可能小于等效 Epoch。</div>';
+      html += '<div class="stage-note">注意：存在 phase_global_batch > 数据集样本数。DataLoader 会重复采样补满 batch，不会留空位。</div>';
     }
     html += '<div class="stage-note">CKPT 规则: 1024=x, 768=ceil(1.78x), 512=ceil(4x)，x=' + preview.saveEveryEpochs + "（可调占比）</div>";
-    html += '<div class="stage-note">Sample 规则: 1024=x, 768=ceil(1.78x), 512=ceil(4x)，x=' + preview.baseSampleEveryEpochs + "（可调占比）</div>";
+    html += '<div class="stage-note">Sample 规则: 1024=x, 768=ceil(1.78x), 512=ceil(4x)，x=' + preview.baseSampleEveryEpochs + "（仅在 enable_preview + sample_every_n_epochs 生效时用于 epoch 取整）</div>";
+    html += '<div class="stage-note">Resume 逻辑: runner 会优先按 staged_plan_id 匹配 state，并以 current_global_samples（缺失则回退 current_step）推断续训阶段；若正好命中阶段边界，将自动设置 resume_epoch_offset=1 进入下一阶段。</div>';
     html += "<table><thead><tr><th>阶段</th><th>Raw 验算</th><th>实际验算</th></tr></thead><tbody>";
     for (var j = 0; j < preview.rows.length; j++) {
       var r = preview.rows[j];
@@ -895,6 +995,14 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       /num_processes/i,
       /进程数/
     ]);
+    var enableDistributedField = findSchemaField([
+      /enable_distributed_training/i,
+      /分布式训练/
+    ]);
+    var numMachinesField = findSchemaField([
+      /num_machines/i,
+      /机器数量/
+    ]);
 
     var baseBatch = batchField ? readInt(batchField.item, 0) : 0;
     var baseGradAccum = gradAccumField ? readInt(gradAccumField.item, 1) : 1;
@@ -904,10 +1012,19 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     var baseSampleEveryEpochs = sampleEveryField ? readInt(sampleEveryField.item, 1) : 1;
     var trainDataDir = trainDataDirField ? readText(trainDataDirField.item).trim() : "";
     var numProcesses = numProcessesField ? readInt(numProcessesField.item, 1) : 1;
+    var enableDistributed = enableDistributedField ? readBool(enableDistributedField.item) : false;
+    var numMachines = numMachinesField ? readInt(numMachinesField.item, 1) : 1;
+    var worldSize = 1;
     if (baseGradAccum <= 0) baseGradAccum = 1;
     if (saveEveryEpochs <= 0) saveEveryEpochs = 1;
     if (baseSampleEveryEpochs <= 0) baseSampleEveryEpochs = 1;
     if (numProcesses <= 0) numProcesses = 1;
+    if (numMachines <= 0) numMachines = 1;
+    if (!enableDistributed) {
+      numMachines = 1;
+    }
+    worldSize = Math.max(1, numProcesses * numMachines);
+    var useSampleEpochSchedule = previewEnabled && baseSampleEveryEpochs > 0;
 
     requestTrainImageCount(trainDataDir);
 
@@ -934,22 +1051,32 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       baseEpochs,
       saveEveryEpochs,
       baseSampleEveryEpochs,
-      previewEnabled,
+      useSampleEpochSchedule,
       ratioState.ratios,
       state.trainImageCount,
-      numProcesses
+      worldSize
     );
+    if (!preview.ok) {
+      if (statusBlock) {
+        updateStatus(statusBlock, "阶段分辨率配置错误: " + preview.message);
+      }
+      renderInvalidPreview(previewBlock, preview.message);
+      return;
+    }
     if (statusBlock) {
-      if (previewEnabled) {
+      if (preview.useSampleEpochSchedule) {
         updateStatus(
           statusBlock,
-          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；梯度累加保持与 1024 基准一致，ckpt 与 sample 频率按 1024=x, 768=ceil(1.78x), 512=ceil(4x)（向上取整），并纳入实际 epoch 取整。"
+          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；world_size=" + worldSize + "；batch 按全局语义校验；ckpt 与 sample 频率按 1024=x, 768=ceil(1.78x), 512=ceil(4x) 并共同参与 epoch 取整。"
         );
       } else {
         updateStatus(
           statusBlock,
-          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；梯度累加保持与 1024 基准一致，ckpt 频率按 1024=x, 768=ceil(1.78x), 512=ceil(4x)（向上取整），并已实时预估三阶段 batch 与 epoch（未启用训练预览图时不纳入 sample 频率取整）。"
+          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；world_size=" + worldSize + "；batch 按全局语义校验；当前仅按 ckpt 频率进行 epoch 取整（sample 调度未生效）。"
         );
+      }
+      if (!previewEnabled) {
+        updateStatus(statusBlock, statusBlock.textContent + "（当前 enable_preview=off）");
       }
     }
     renderPreview(previewBlock, preview);
@@ -1338,360 +1465,6 @@ _CTRL_S_SAVE_CONFIG_INJECTION = """
 </script>
 """
 
-_BATCH_SIZE_PROBE_INJECTION = """
-<style id="mikazuki-batch-probe-style">
-#mikazuki-batch-probe-wrap {
-  margin: 6px 0 10px 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-#mikazuki-batch-probe-btn {
-  width: fit-content;
-  min-width: 180px;
-  height: 32px;
-  padding: 0 12px;
-  border: 1px solid #7ea7db;
-  border-radius: 6px;
-  background: #edf4ff;
-  color: #15437a;
-  cursor: pointer;
-}
-#mikazuki-batch-probe-btn[disabled] {
-  opacity: 0.7;
-  cursor: wait;
-}
-#mikazuki-batch-probe-status {
-  font-size: 12px;
-  line-height: 1.4;
-  color: #606266;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-#mikazuki-batch-probe-status.error {
-  color: #c45656;
-}
-</style>
-<script id="mikazuki-batch-probe">
-(function () {
-  if (window.__MIKAZUKI_BATCH_PROBE__) return;
-  window.__MIKAZUKI_BATCH_PROBE__ = true;
-
-  var state = {
-    running: false,
-    scheduled: false
-  };
-
-  function getSchemaForm() {
-    return (
-      document.querySelector(".k-form") ||
-      document.querySelector(".schema-container form") ||
-      document.querySelector("form")
-    );
-  }
-
-  function getSchemaItems() {
-    var form = getSchemaForm();
-    if (!form) return [];
-    return form.querySelectorAll(".k-schema-item");
-  }
-
-  function getItemSearchText(item, title) {
-    var titleText = (title && title.textContent ? title.textContent : "").trim();
-    var itemText = (item && item.textContent ? item.textContent : "").trim();
-    return (titleText + " " + itemText).toLowerCase();
-  }
-
-  function findSchemaField(patterns) {
-    var items = getSchemaItems();
-    if (!patterns || patterns.length === 0) return null;
-    for (var i = 0; i < items.length; i++) {
-      var item = items[i];
-      var title = item.querySelector("h3");
-      var searchText = getItemSearchText(item, title);
-      for (var j = 0; j < patterns.length; j++) {
-        if (patterns[j].test(searchText)) {
-          return { item: item, title: title, searchText: searchText };
-        }
-      }
-    }
-    return null;
-  }
-
-  function findValueElement(item, preferCheckbox) {
-    if (!item) return null;
-    if (preferCheckbox) {
-      var cb = item.querySelector("input[type='checkbox']");
-      if (cb) return cb;
-    }
-
-    var select = item.querySelector("select");
-    if (select) return select;
-
-    var textarea = item.querySelector("textarea");
-    if (textarea) return textarea;
-
-    var inputs = item.querySelectorAll("input");
-    for (var i = 0; i < inputs.length; i++) {
-      var input = inputs[i];
-      var type = String(input.getAttribute("type") || "").toLowerCase();
-      if (type === "hidden") continue;
-      if (type === "checkbox" && !preferCheckbox) continue;
-      if (type === "radio" && !input.checked) continue;
-      return input;
-    }
-    return null;
-  }
-
-  function dispatchInput(input) {
-    if (!input) return;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-  }
-
-  function parseMaybeNumber(raw) {
-    var text = String(raw == null ? "" : raw).trim();
-    if (text === "") return "";
-    if (!/^-?\\d+(\\.\\d+)?$/.test(text)) return text;
-    var n = Number(text);
-    return Number.isFinite(n) ? n : text;
-  }
-
-  function readFieldValue(item) {
-    if (!item) return undefined;
-    var checkbox = findValueElement(item, true);
-    if (checkbox && String(checkbox.getAttribute("type") || "").toLowerCase() === "checkbox") {
-      return !!checkbox.checked;
-    }
-
-    var el = findValueElement(item, false);
-    if (!el) return undefined;
-    var tag = String(el.tagName || "").toLowerCase();
-    if (tag === "select" || tag === "textarea") {
-      var textValue = String(el.value || "").trim();
-      return textValue;
-    }
-
-    var type = String(el.getAttribute("type") || "").toLowerCase();
-    if (type === "number" || type === "range") {
-      return parseMaybeNumber(el.value);
-    }
-    if (type === "checkbox") return !!el.checked;
-    return parseMaybeNumber(el.value);
-  }
-
-  function writeNumberField(item, value) {
-    var el = findValueElement(item, false);
-    if (!el) return false;
-    var next = String(value);
-    if (String(el.value || "").trim() === next) return false;
-    el.value = next;
-    dispatchInput(el);
-    return true;
-  }
-
-  function setStatus(statusEl, message, isError) {
-    if (!statusEl) return;
-    statusEl.textContent = String(message == null ? "" : message);
-    if (isError) statusEl.classList.add("error");
-    else statusEl.classList.remove("error");
-  }
-
-  function summarizeTrials(trials) {
-    if (!Array.isArray(trials) || trials.length === 0) return "";
-    var parts = [];
-    for (var i = 0; i < trials.length; i++) {
-      var t = trials[i] || {};
-      parts.push(String(t.batch_size) + ":" + String(t.status || "unknown"));
-    }
-    return parts.join(", ");
-  }
-
-  function setIfFound(config, key, patterns) {
-    var field = findSchemaField(patterns);
-    if (!field) return;
-    var value = readFieldValue(field.item);
-    if (value === undefined || value === null) return;
-    if (typeof value === "string" && value.trim() === "") return;
-    config[key] = value;
-  }
-
-  function collectProbeConfig() {
-    var cfg = {};
-    setIfFound(cfg, "model_train_type", [/model_train_type/i, /训练种类/, /train type/]);
-    setIfFound(cfg, "pretrained_model_name_or_path", [/pretrained_model_name_or_path/i, /底模文件路径/]);
-    setIfFound(cfg, "train_data_dir", [/train_data_dir/i, /训练数据集路径/]);
-    setIfFound(cfg, "reg_data_dir", [/reg_data_dir/i, /正则化数据集路径/]);
-    setIfFound(cfg, "resolution", [/(^|[^a-z])resolution([^a-z]|$)/i, /训练图片分辨率/, /训练分辨率/]);
-
-    setIfFound(cfg, "train_batch_size", [/train_batch_size/i, /批量大小/]);
-    setIfFound(cfg, "gradient_checkpointing", [/gradient_checkpointing/i, /梯度检查点/]);
-    setIfFound(cfg, "gradient_accumulation_steps", [/gradient_accumulation_steps/i, /梯度累加/, /梯度累积/]);
-
-    setIfFound(cfg, "enable_bucket", [/enable_bucket/i, /arb.*桶/, /启用 arb/]);
-    setIfFound(cfg, "min_bucket_reso", [/min_bucket_reso/i, /桶最小分辨率/]);
-    setIfFound(cfg, "max_bucket_reso", [/max_bucket_reso/i, /桶最大分辨率/]);
-    setIfFound(cfg, "bucket_reso_steps", [/bucket_reso_steps/i, /桶分辨率划分单位/]);
-    setIfFound(cfg, "bucket_no_upscale", [/bucket_no_upscale/i, /桶不放大图片/]);
-
-    setIfFound(cfg, "network_module", [/network_module/i, /训练网络模块/]);
-    setIfFound(cfg, "network_dim", [/network_dim/i, /网络维度/]);
-    setIfFound(cfg, "network_alpha", [/network_alpha/i, /网络alpha/]);
-    setIfFound(cfg, "network_dropout", [/network_dropout/i, /dropout/]);
-    setIfFound(cfg, "network_train_unet_only", [/network_train_unet_only/i, /仅训练\\s*u-?net/]);
-    setIfFound(cfg, "network_train_text_encoder_only", [/network_train_text_encoder_only/i, /仅训练文本编码器/]);
-
-    setIfFound(cfg, "optimizer_type", [/optimizer_type/i, /优化器/]);
-    setIfFound(cfg, "learning_rate", [/learning_rate/i, /总学习率/]);
-    setIfFound(cfg, "unet_lr", [/unet_lr/i, /u-?net\\s*学习率/]);
-    setIfFound(cfg, "text_encoder_lr", [/text_encoder_lr/i, /文本编码器学习率/]);
-
-    setIfFound(cfg, "mixed_precision", [/mixed_precision/i, /混合精度/]);
-    setIfFound(cfg, "full_fp16", [/full_fp16/i, /完全使用\\s*fp16/]);
-    setIfFound(cfg, "full_bf16", [/full_bf16/i, /完全使用\\s*bf16/]);
-    setIfFound(cfg, "xformers", [/xformers/i]);
-    setIfFound(cfg, "sdpa", [/sdpa/i]);
-    setIfFound(cfg, "lowram", [/lowram/i, /低内存模式/]);
-    setIfFound(cfg, "cache_latents", [/cache_latents([^_]|$)/i, /缓存图像\\s*latent/]);
-    setIfFound(cfg, "cache_latents_to_disk", [/cache_latents_to_disk/i, /缓存图像\\s*latent\\s*到磁盘/]);
-    setIfFound(cfg, "cache_text_encoder_outputs", [/cache_text_encoder_outputs([^_]|$)/i, /缓存文本编码器的输出/]);
-    setIfFound(cfg, "cache_text_encoder_outputs_to_disk", [/cache_text_encoder_outputs_to_disk/i, /缓存文本编码器的输出到磁盘/]);
-    setIfFound(cfg, "persistent_data_loader_workers", [/persistent_data_loader_workers/i, /保留加载训练集的worker/]);
-    setIfFound(cfg, "vae", [/^vae\\b/i, /vae 模型文件路径/]);
-    setIfFound(cfg, "no_half_vae", [/no_half_vae/i, /不使用半精度\\s*vae/]);
-
-    if (!cfg.model_train_type || String(cfg.model_train_type).trim() === "") {
-      cfg.model_train_type = "sdxl-lora";
-    }
-    return cfg;
-  }
-
-  function ensureProbeBlock(batchField, gradField) {
-    if (!batchField || !batchField.item || !batchField.item.parentNode) return null;
-    var form = getSchemaForm();
-    if (!form) return null;
-
-    var wrap = form.querySelector("#mikazuki-batch-probe-wrap");
-    if (!wrap) {
-      wrap = document.createElement("div");
-      wrap.id = "mikazuki-batch-probe-wrap";
-      wrap.innerHTML =
-        '<button id="mikazuki-batch-probe-btn" type="button">一键检测 Batch Size</button>' +
-        '<div id="mikazuki-batch-probe-status">点击后将按当前分辨率和当前训练配置进行短跑探测。</div>';
-    }
-
-    if (gradField && gradField.item && gradField.item.parentNode === batchField.item.parentNode) {
-      if (gradField.item.previousSibling !== wrap) {
-        gradField.item.parentNode.insertBefore(wrap, gradField.item);
-      }
-    } else if (batchField.item.nextSibling !== wrap) {
-      batchField.item.parentNode.insertBefore(wrap, batchField.item.nextSibling);
-    }
-
-    return {
-      wrap: wrap,
-      button: wrap.querySelector("#mikazuki-batch-probe-btn"),
-      status: wrap.querySelector("#mikazuki-batch-probe-status")
-    };
-  }
-
-  async function triggerProbe(button, statusEl) {
-    if (!button || state.running) return;
-    var cfg = collectProbeConfig();
-
-    if (!cfg.pretrained_model_name_or_path || !cfg.train_data_dir || !cfg.resolution) {
-      setStatus(statusEl, "检测失败：请先填写底模路径、训练数据集路径、训练分辨率。", true);
-      return;
-    }
-
-    state.running = true;
-    button.disabled = true;
-    setStatus(statusEl, "正在检测，请稍候（会进行真实短训练探测）...", false);
-    try {
-      var resp = await fetch("/api/probe_batch_size", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(cfg)
-      });
-      var payload = await resp.json();
-      if (!payload || payload.status !== "success") {
-        setStatus(statusEl, "检测失败：" + String(payload && payload.message ? payload.message : "未知错误"), true);
-        return;
-      }
-
-      var data = payload.data || {};
-      var recommended = Number(data.recommended_batch_size || 0);
-      var maxStable = Number(data.max_stable_batch_size || 0);
-      var sharedMemHits = Number(data.shared_memory_hit_count || 0);
-      var hasSharedMemHits = !!data.has_shared_memory_hits;
-      if (recommended > 0) {
-        var currentBatchField = findSchemaField([/train_batch_size/i, /批量大小/]);
-        if (currentBatchField && currentBatchField.item) {
-          writeNumberField(currentBatchField.item, recommended);
-        }
-      }
-      var est = data.estimated_range || {};
-      var estLow = Number(est.low || 0);
-      var estHigh = Number(est.high || 0);
-      var mem = data.gpu_memory || {};
-      var memTotal = Number(mem.total_mib || 0);
-      var summary = summarizeTrials(data.trials);
-      var msg = "检测完成，推荐 batch_size=" + recommended;
-      if (maxStable > 0) {
-        msg += "（最大稳定值=" + maxStable + "，已预留安全余量）";
-      }
-      if (estLow > 0 && estHigh > 0) {
-        msg += "；显存预估范围: " + estLow + "~" + estHigh;
-      }
-      if (memTotal > 0) {
-        msg += "；GPU总显存: " + memTotal + "MiB";
-      }
-      if (hasSharedMemHits || sharedMemHits > 0) {
-        msg += "；进程级共享显存命中: " + sharedMemHits + " 次（仅在独显接近满载时触发降档）";
-      }
-      if (summary) {
-        msg += "；测试记录: " + summary;
-      }
-      setStatus(statusEl, msg, false);
-    } catch (e) {
-      setStatus(statusEl, "检测失败：网络异常或后端不可用。", true);
-    } finally {
-      state.running = false;
-      button.disabled = false;
-    }
-  }
-
-  function update() {
-    var batchField = findSchemaField([/train_batch_size/i, /批量大小/]);
-    if (!batchField) return;
-    var gradField = findSchemaField([/gradient_checkpointing/i, /梯度检查点/]);
-    var block = ensureProbeBlock(batchField, gradField);
-    if (!block || !block.button) return;
-
-    if (!block.button.__mikazukiBound) {
-      block.button.__mikazukiBound = true;
-      block.button.addEventListener("click", function () {
-        triggerProbe(block.button, block.status);
-      });
-    }
-  }
-
-  function scheduleUpdate() {
-    if (state.scheduled) return;
-    state.scheduled = true;
-    setTimeout(function () {
-      state.scheduled = false;
-      update();
-    }, 60);
-  }
-
-  var observer = new MutationObserver(function () { scheduleUpdate(); });
-  observer.observe(document.documentElement, { childList: true, subtree: true });
-  window.addEventListener("load", function () { scheduleUpdate(); });
-  setInterval(scheduleUpdate, 1000);
-})();
-</script>
-"""
 _patched_frontend_html_cache: dict[str, tuple[int, str]] = {}
 
 
@@ -1767,20 +1540,6 @@ def _inject_ctrl_s_save_config(html_content: str) -> str:
     return _CTRL_S_SAVE_CONFIG_INJECTION + "\n" + html_content
 
 
-def _inject_batch_size_probe(html_content: str) -> str:
-    if 'id="mikazuki-batch-probe"' in html_content:
-        return html_content
-
-    module_tag = '<script type="module"'
-    if module_tag in html_content:
-        return html_content.replace(module_tag, _BATCH_SIZE_PROBE_INJECTION + "\n" + module_tag, 1)
-
-    if "</head>" in html_content:
-        return html_content.replace("</head>", _BATCH_SIZE_PROBE_INJECTION + "\n</head>", 1)
-
-    return _BATCH_SIZE_PROBE_INJECTION + "\n" + html_content
-
-
 def _resolve_frontend_html_file(request_path: str) -> Path | None:
     if not FRONTEND_STATIC_DIR:
         return None
@@ -1831,7 +1590,6 @@ def _get_patched_frontend_html_content(request_path: str) -> str | None:
     content = _inject_hide_deprecated_lora_docs(content)
     content = _inject_tensorboard_runs_default(content)
     content = _inject_ctrl_s_save_config(content)
-    content = _inject_batch_size_probe(content)
     content = _inject_worker_mode_guard(content)
     content = _inject_staged_resolution_preview(content)
     _patched_frontend_html_cache[cache_key] = (mtime_ns, content)

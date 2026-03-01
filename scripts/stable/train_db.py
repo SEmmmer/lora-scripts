@@ -200,8 +200,32 @@ def train(args):
         persistent_workers=args.persistent_data_loader_workers,
     )
 
-    # 学習ステップ数を計算する
-    if args.max_train_epochs is not None:
+    # Keep training budget topology-agnostic: track target samples globally
+    # and convert them to optimizer steps for the current world size.
+    train_images_with_repeats = int(train_dataset_group.num_train_images)
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    target_global_train_samples = getattr(args, "target_global_train_samples", None)
+    try:
+        target_global_train_samples = int(target_global_train_samples) if target_global_train_samples is not None else None
+    except Exception:
+        target_global_train_samples = None
+    if target_global_train_samples is not None and target_global_train_samples <= 0:
+        target_global_train_samples = None
+
+    if target_global_train_samples is None:
+        if args.max_train_epochs is not None:
+            target_global_train_samples = int(args.max_train_epochs) * int(train_images_with_repeats)
+        elif args.max_train_steps is not None:
+            target_global_train_samples = int(args.max_train_steps) * int(total_batch_size)
+
+    if target_global_train_samples is not None:
+        args.target_global_train_samples = int(target_global_train_samples)
+        args.max_train_steps = max(1, int(math.ceil(args.target_global_train_samples / max(1, total_batch_size))))
+        accelerator.print(
+            "override steps from global sample target / グローバルサンプル目標からステップ数を再計算: "
+            f"target_samples={args.target_global_train_samples}, steps={args.max_train_steps}"
+        )
+    elif args.max_train_epochs is not None:
         args.max_train_steps = args.max_train_epochs * math.ceil(
             len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
         )
@@ -265,7 +289,6 @@ def train(args):
         args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
 
     # 学習する
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     accelerator.print("running training / 学習開始")
     accelerator.print(f"  num train images * repeats / 学習画像の数×繰り返し回数: {train_dataset_group.num_train_images}")
     accelerator.print(f"  num reg images / 正則化画像の数: {train_dataset_group.num_reg_images}")
@@ -277,8 +300,11 @@ def train(args):
     )
     accelerator.print(f"  gradient ccumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
     accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
+    if getattr(args, "target_global_train_samples", None) is not None:
+        accelerator.print(f"  target global samples (topology-agnostic): {int(args.target_global_train_samples):,}")
 
     progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+    gpu_power_averager = train_util.GPUPowerAverager() if accelerator.is_local_main_process else None
     global_step = 0
 
     noise_scheduler = DDPMScheduler(
@@ -430,6 +456,7 @@ def train(args):
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
             logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+            train_util.append_gpu_power_to_logs(logs, gpu_power_averager)
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -518,6 +545,7 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
     )
+    parser.add_argument("--target_global_train_samples", type=int, default=None, help=argparse.SUPPRESS)
 
     return parser
 

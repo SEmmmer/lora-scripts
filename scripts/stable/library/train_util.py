@@ -5,12 +5,14 @@ import ast
 import asyncio
 import datetime
 import importlib
+import threading
 import json
 import logging
 import pathlib
 import re
 import shutil
 import time
+from collections import deque
 from typing import (
     Dict,
     List,
@@ -104,6 +106,126 @@ DEFAULT_STEP_NAME = "at"
 STEP_STATE_NAME = "{}-step{:08d}-state"
 STEP_FILE_NAME = "{}-step{:08d}"
 STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
+
+GPU_POWER_QUERY_INTERVAL_SEC = 1.0
+GPU_POWER_SLIDING_WINDOW_SEC = 30.0
+
+
+class GPUPowerAverager:
+    """Best-effort GPU power sampler based on nvidia-smi."""
+
+    def __init__(self, sample_interval_sec: float = GPU_POWER_QUERY_INTERVAL_SEC, sliding_window_sec: float = GPU_POWER_SLIDING_WINDOW_SEC):
+        self.sample_interval_sec = max(0.1, float(sample_interval_sec))
+        self.sliding_window_sec = max(1.0, float(sliding_window_sec))
+        self.snapshot_samples = deque()  # [(timestamp_sec, power_w)]
+        self.cached_power_w = None
+        self.device_ids = self._parse_visible_device_ids()
+        self.available = True
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._sampler_thread = threading.Thread(target=self._sampling_loop, daemon=True)
+        self._sampler_thread.start()
+
+    @staticmethod
+    def _parse_visible_device_ids():
+        raw = str(os.environ.get("CUDA_VISIBLE_DEVICES", "") or "").strip()
+        if not raw:
+            return None
+        result = []
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if not token.isdigit():
+                return None
+            result.append(int(token))
+        return result if result else None
+
+    def _query_snapshot_power_w(self):
+        cmd = ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"]
+        if self.device_ids:
+            cmd.extend(["-i", ",".join(str(i) for i in self.device_ids)])
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+        except Exception:
+            self.available = False
+            return None
+
+        if proc.returncode != 0:
+            self.available = False
+            return None
+
+        values = []
+        for line in str(proc.stdout or "").splitlines():
+            token = line.strip()
+            if not token:
+                continue
+            try:
+                values.append(float(token))
+            except Exception:
+                continue
+        if not values:
+            return None
+        return float(sum(values) / len(values))
+
+    def _trim_locked(self, now_ts: float):
+        cutoff_ts = now_ts - self.sliding_window_sec
+        while self.snapshot_samples and self.snapshot_samples[0][0] < cutoff_ts:
+            self.snapshot_samples.popleft()
+
+    def _add_sample(self, ts: float, power_w: float):
+        with self._lock:
+            self.snapshot_samples.append((float(ts), float(power_w)))
+            self._trim_locked(float(ts))
+
+    def _sampling_loop(self):
+        # Keep sampling frequency independent from training step duration.
+        while not self._stop_event.is_set() and self.available:
+            start_ts = time.time()
+            snapshot = self._query_snapshot_power_w()
+            now_ts = time.time()
+            if snapshot is not None:
+                self._add_sample(now_ts, float(snapshot))
+            elapsed = max(0.0, now_ts - start_ts)
+            sleep_sec = max(0.0, self.sample_interval_sec - elapsed)
+            if self._stop_event.wait(timeout=sleep_sec):
+                break
+
+    def get_average_power_w(self):
+        if not self.available:
+            return None
+        now = time.time()
+        with self._lock:
+            self._trim_locked(now)
+            if not self.snapshot_samples:
+                return self.cached_power_w
+            values = [item[1] for item in self.snapshot_samples]
+        if not values:
+            return self.cached_power_w
+        self.cached_power_w = float(sum(values) / len(values))
+        return self.cached_power_w
+
+    def close(self):
+        self._stop_event.set()
+        if self._sampler_thread.is_alive():
+            self._sampler_thread.join(timeout=0.5)
+
+
+def append_gpu_power_to_logs(logs: dict, power_averager: Optional[GPUPowerAverager]):
+    if power_averager is None:
+        return logs
+    power_w = power_averager.get_average_power_w()
+    if power_w is not None:
+        logs["gpu_power_avg_w"] = round(float(power_w), 1)
+    return logs
+
 
 # region dataset
 
