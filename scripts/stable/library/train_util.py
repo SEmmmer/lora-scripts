@@ -4770,8 +4770,16 @@ def get_optimizer(args, trainable_params):
 
             # set optimizer
             if optimizer_type == "DAdaptation".lower() or optimizer_type == "DAdaptAdamPreprint".lower():
-                optimizer_class = experimental.DAdaptAdamPreprint
-                logger.info(f"use D-Adaptation AdamPreprint optimizer | {optimizer_kwargs}")
+                # dadaptation 2.x does not expose DAdaptAdamPreprint; fall back to DAdaptAdam.
+                optimizer_class = getattr(experimental, "DAdaptAdamPreprint", None)
+                if optimizer_class is None:
+                    optimizer_class = dadaptation.DAdaptAdam
+                    logger.warning(
+                        "DAdaptAdamPreprint is unavailable in current dadaptation version, fallback to DAdaptAdam"
+                    )
+                    logger.info(f"use D-Adaptation Adam optimizer | {optimizer_kwargs}")
+                else:
+                    logger.info(f"use D-Adaptation AdamPreprint optimizer | {optimizer_kwargs}")
             elif optimizer_type == "DAdaptAdaGrad".lower():
                 optimizer_class = dadaptation.DAdaptAdaGrad
                 logger.info(f"use D-Adaptation AdaGrad optimizer | {optimizer_kwargs}")
@@ -4785,7 +4793,12 @@ def get_optimizer(args, trainable_params):
                 optimizer_class = experimental.DAdaptAdanIP
                 logger.info(f"use D-Adaptation AdanIP optimizer | {optimizer_kwargs}")
             elif optimizer_type == "DAdaptLion".lower():
-                optimizer_class = dadaptation.DAdaptLion
+                optimizer_class = getattr(dadaptation, "DAdaptLion", None)
+                if optimizer_class is None:
+                    raise ValueError(
+                        "DAdaptLion is not available in current dadaptation version. "
+                        "Install a newer dadaptation build or choose another optimizer type."
+                    )
                 logger.info(f"use D-Adaptation Lion optimizer | {optimizer_kwargs}")
             elif optimizer_type == "DAdaptSGD".lower():
                 optimizer_class = dadaptation.DAdaptSGD
