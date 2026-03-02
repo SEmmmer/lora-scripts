@@ -6,7 +6,9 @@ import sys
 import random
 import time
 import json
+from pathlib import Path
 from multiprocessing import Value
+from typing import Dict
 import toml
 
 from tqdm import tqdm
@@ -77,6 +79,8 @@ class NetworkTrainer:
         self._resume_active_training_time_sec = 0.0
         self._run_started_at = None
         self._tensorboard_walltime_base = None
+        # tag -> max logged step from existing TensorBoard event files
+        self._tensorboard_existing_max_step_by_tag: Dict[str, int] = {}
 
     def _get_effective_active_training_time_sec(self):
         if self._run_started_at is None:
@@ -101,10 +105,89 @@ class NetworkTrainer:
                 other_trackers.append(tracker_obj)
 
         if tensorboard_tracker is not None:
-            tensorboard_tracker.log(logs, step=step_value, walltime=self._get_tensorboard_walltime())
+            tensorboard_logs = logs
+            if self._tensorboard_existing_max_step_by_tag:
+                # During resume catch-up, skip logging points that already exist in TensorBoard.
+                tensorboard_logs = {}
+                for key, value in logs.items():
+                    max_existing_step = self._tensorboard_existing_max_step_by_tag.get(str(key))
+                    if max_existing_step is not None and int(step_value) <= int(max_existing_step):
+                        continue
+                    tensorboard_logs[str(key)] = value
+
+            if tensorboard_logs:
+                tensorboard_tracker.log(tensorboard_logs, step=step_value, walltime=self._get_tensorboard_walltime())
 
         for tracker in other_trackers:
             tracker.log(logs, step=step_value)
+
+    def _scan_tensorboard_existing_max_step_by_tag(self, logging_dir: str) -> Dict[str, int]:
+        max_step_by_tag: Dict[str, int] = {}
+        if not logging_dir:
+            return max_step_by_tag
+
+        log_dir = Path(str(logging_dir)).expanduser()
+        if not log_dir.exists() or not log_dir.is_dir():
+            return max_step_by_tag
+
+        try:
+            from tensorboard.backend.event_processing.event_file_loader import LegacyEventFileLoader
+        except Exception:
+            logger.warning(
+                "failed to import tensorboard event loader for resume catch-up filtering; "
+                "TensorBoard duplicate-step filtering is disabled",
+                exc_info=True,
+            )
+            return max_step_by_tag
+
+        for event_file in log_dir.rglob("events.out.tfevents.*"):
+            if not event_file.is_file():
+                continue
+            try:
+                for event in LegacyEventFileLoader(str(event_file)).Load():
+                    summary = getattr(event, "summary", None)
+                    if summary is None:
+                        continue
+                    step = int(getattr(event, "step", 0) or 0)
+                    for value in summary.value:
+                        tag = str(getattr(value, "tag", "") or "")
+                        if not tag:
+                            continue
+                        prev = max_step_by_tag.get(tag)
+                        if prev is None or step > prev:
+                            max_step_by_tag[tag] = step
+            except Exception:
+                logger.warning(
+                    "failed to parse tensorboard event file for resume catch-up filtering: %s",
+                    event_file,
+                    exc_info=True,
+                )
+                continue
+
+        return max_step_by_tag
+
+    def _prepare_tensorboard_resume_catchup_filter(self, args: argparse.Namespace, resume_start_step: int):
+        self._tensorboard_existing_max_step_by_tag = {}
+
+        if not getattr(args, "resume", None):
+            return
+
+        logging_dir = getattr(args, "logging_dir", None)
+        if not logging_dir:
+            return
+
+        max_step_by_tag = self._scan_tensorboard_existing_max_step_by_tag(logging_dir)
+        if not max_step_by_tag:
+            return
+
+        self._tensorboard_existing_max_step_by_tag = max_step_by_tag
+        existing_max = max(max_step_by_tag.values()) if max_step_by_tag else 0
+        logger.info(
+            "tensorboard resume catch-up filter enabled: resume_step=%s, existing_max_step=%s "
+            "(logs with step <= existing max for the same tag will be skipped)",
+            int(resume_start_step),
+            int(existing_max),
+        )
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -1010,6 +1093,8 @@ class NetworkTrainer:
                 config=train_util.get_sanitized_config_or_none(args),
                 init_kwargs=init_kwargs,
             )
+
+        self._prepare_tensorboard_resume_catchup_filter(args, resume_start_step)
 
         loss_recorder = train_util.LossRecorder()
         del train_dataset_group
