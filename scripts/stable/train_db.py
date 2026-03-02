@@ -317,8 +317,6 @@ def train(args):
 
     if accelerator.is_main_process:
         init_kwargs = {}
-        if args.wandb_run_name:
-            init_kwargs["wandb"] = {"name": args.wandb_run_name}
         if args.log_tracker_config is not None:
             init_kwargs = toml.load(args.log_tracker_config)
         accelerator.init_trackers("dreambooth" if args.log_tracker_name is None else args.log_tracker_name, config=train_util.get_sanitized_config_or_none(args), init_kwargs=init_kwargs)
@@ -452,12 +450,13 @@ def train(args):
             if args.logging_dir is not None:
                 logs = {"loss": current_loss}
                 train_util.append_lr_to_logs(logs, lr_scheduler, args.optimizer_type, including_unet=True)
+                train_util.append_gpu_metrics_to_tensorboard_logs(logs, gpu_power_averager)
                 accelerator.log(logs, step=global_step)
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
             logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-            train_util.append_gpu_power_to_logs(logs, gpu_power_averager)
+            train_util.append_gpu_power_to_logs(logs, gpu_power_averager, compact_for_postfix=True)
             train_util.append_mesh_net_iops_to_logs(logs, mesh_net_iops_averager)
             progress_bar.set_postfix(**logs)
 

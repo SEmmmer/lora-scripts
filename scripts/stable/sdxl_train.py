@@ -256,7 +256,9 @@ def train(args):
         accelerator.print("Disable Diffusers' xformers")
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
-            vae.set_use_memory_efficient_attention_xformers(args.xformers)
+            train_util.try_set_vae_memory_efficient_attention_xformers(
+                vae, args.xformers, args.xformers_vae_fallback
+            )
 
     # 学習を準備する
     if cache_latents:
@@ -617,8 +619,6 @@ def train(args):
 
     if accelerator.is_main_process:
         init_kwargs = {}
-        if args.wandb_run_name:
-            init_kwargs["wandb"] = {"name": args.wandb_run_name}
         if args.log_tracker_config is not None:
             init_kwargs = toml.load(args.log_tracker_config)
         accelerator.init_trackers(
@@ -837,13 +837,14 @@ def train(args):
                     train_util.append_lr_to_logs(logs, lr_scheduler, args.optimizer_type, including_unet=train_unet)
                 else:
                     append_block_lr_to_logs(block_lrs, logs, lr_scheduler, args.optimizer_type)  # U-Net is included in block_lrs
+                train_util.append_gpu_metrics_to_tensorboard_logs(logs, gpu_power_averager)
 
                 accelerator.log(logs, step=global_step)
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
             logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-            train_util.append_gpu_power_to_logs(logs, gpu_power_averager)
+            train_util.append_gpu_power_to_logs(logs, gpu_power_averager, compact_for_postfix=True)
             train_util.append_mesh_net_iops_to_logs(logs, mesh_net_iops_averager)
             progress_bar.set_postfix(**logs)
 

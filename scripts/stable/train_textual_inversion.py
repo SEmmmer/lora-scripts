@@ -361,7 +361,9 @@ class TextualInversionTrainer:
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
-            vae.set_use_memory_efficient_attention_xformers(args.xformers)
+            train_util.try_set_vae_memory_efficient_attention_xformers(
+                vae, args.xformers, args.xformers_vae_fallback
+            )
 
         # 学習を準備する
         if cache_latents:
@@ -505,8 +507,6 @@ class TextualInversionTrainer:
 
         if accelerator.is_main_process:
             init_kwargs = {}
-            if args.wandb_run_name:
-                init_kwargs["wandb"] = {"name": args.wandb_run_name}
             if args.log_tracker_config is not None:
                 init_kwargs = toml.load(args.log_tracker_config)
             accelerator.init_trackers(

@@ -127,6 +127,41 @@ function Get-CudaVersion {
     return $null
 }
 
+function Assert-BinaryRequirements {
+    param(
+        [string]$PythonBin
+    )
+
+    $wheelCheckDir = Join-Path $ScriptDir ".pip-wheel-check"
+    $downloadLog = Join-Path $wheelCheckDir "download.log"
+
+    if (Test-Path $wheelCheckDir) {
+        Remove-Item -Path $wheelCheckDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $wheelCheckDir | Out-Null
+
+    try {
+        Write-Output "Checking wheel availability for requirements (no local builds)..."
+        & $PythonBin -m pip download --dest $wheelCheckDir --only-binary=:all: -r requirements.txt *> $downloadLog
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output "Binary wheel precheck failed. To avoid local compilation, installation is stopped."
+            $lines = Select-String -Path $downloadLog -Pattern "Could not find a version that satisfies the requirement|No matching distribution found for" -SimpleMatch:$false
+            if ($lines) {
+                $lines | ForEach-Object { Write-Output $_.Line }
+            }
+            else {
+                Get-Content -Path $downloadLog
+            }
+            throw "binary wheel precheck failed"
+        }
+    }
+    finally {
+        if (Test-Path $wheelCheckDir) {
+            Remove-Item -Path $wheelCheckDir -Recurse -Force
+        }
+    }
+}
+
 try {
     Install-Uv
     Install-EmbeddedPython
@@ -188,7 +223,12 @@ try {
     Write-Output "CUDA Version: $cudaVersion"
     $cuda = [version]$cudaVersion
 
-    if ($cuda.Major -ge 12) {
+    if ($cuda.Major -ge 13) {
+        Write-Output "Installing torch 2.10.0+cu130"
+        Invoke-Pip $pythonBin @("install", "torch==2.10.0+cu130", "torchvision==0.25.0+cu130", "--extra-index-url", "https://download.pytorch.org/whl/cu130")
+        Invoke-Pip $pythonBin @("install", "--no-deps", "xformers==0.0.35", "--extra-index-url", "https://download.pytorch.org/whl/cu130")
+    }
+    elseif ($cuda.Major -ge 12) {
         Write-Output "Installing torch 2.10.0+cu128"
         Invoke-Pip $pythonBin @("install", "torch==2.10.0+cu128", "torchvision==0.25.0+cu128", "--extra-index-url", "https://download.pytorch.org/whl/cu128")
         Invoke-Pip $pythonBin @("install", "--no-deps", "xformers==0.0.35", "--extra-index-url", "https://download.pytorch.org/whl/cu128")
@@ -214,8 +254,10 @@ try {
         throw "Unsupported CUDA version: $cudaVersion"
     }
 
+    Assert-BinaryRequirements -PythonBin $pythonBin
+
     Write-Output "Installing deps..."
-    Invoke-Pip $pythonBin @("install", "--upgrade", "-r", "requirements.txt")
+    Invoke-Pip $pythonBin @("install", "--upgrade", "--only-binary=:all:", "-r", "requirements.txt")
 
     Write-Output "Install completed"
 }

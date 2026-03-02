@@ -69,7 +69,7 @@ def run_tensorboard():
             "-m",
             "mikazuki.tensorboard_launcher",
             "--logdir",
-            "logs",
+            "output",
             "--host",
             args.tensorboard_host,
             "--port",

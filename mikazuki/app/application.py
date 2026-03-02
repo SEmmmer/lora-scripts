@@ -1,7 +1,9 @@
 import asyncio
+import json
 import mimetypes
 import os
 import socket
+import subprocess
 import sys
 import webbrowser
 from contextlib import asynccontextmanager
@@ -32,6 +34,60 @@ elif os.path.exists("./frontend/index.html"):
 else:
     FRONTEND_STATIC_DIR = None
     FRONTEND_INDEX_FILE = None
+
+
+def _normalize_github_repo_url(raw_url: str) -> str | None:
+    text = str(raw_url or "").strip()
+    if not text:
+        return None
+
+    path = ""
+    if text.startswith("git@github.com:"):
+        path = text.split(":", 1)[1]
+    elif text.startswith("ssh://git@github.com/"):
+        path = text.split("github.com/", 1)[1]
+    elif text.startswith("https://github.com/"):
+        path = text.split("github.com/", 1)[1]
+    elif text.startswith("http://github.com/"):
+        path = text.split("github.com/", 1)[1]
+    else:
+        return None
+
+    path = path.strip().strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if not path or "/" not in path:
+        return None
+    return f"https://github.com/{path}"
+
+
+def _resolve_issue_target_url() -> str:
+    # Optional override for custom deployment.
+    override = str(os.environ.get("MIKAZUKI_ISSUE_URL", "") or "").strip()
+    if override:
+        return override
+
+    repo_override = _normalize_github_repo_url(os.environ.get("MIKAZUKI_REPO_URL", ""))
+    if repo_override:
+        return f"{repo_override}/issues"
+
+    try:
+        origin_url = subprocess.check_output(
+            ["git", "remote", "get-url", "origin"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        origin_url = ""
+
+    repo_url = _normalize_github_repo_url(origin_url)
+    if repo_url:
+        return f"{repo_url}/issues"
+
+    return "https://github.com/Akegarasu/lora-scripts/issues"
+
+
+ABOUT_ISSUE_TARGET_URL = _resolve_issue_target_url()
 
 _WORKER_MODE_GUARD_INJECTION = """
 <style id="mikazuki-worker-rank-guard-style">
@@ -1169,6 +1225,134 @@ _HIDE_DEPRECATED_LORA_DOCS_INJECTION = """
 </script>
 """
 
+_UI_SETTINGS_ABOUT_CLEANUP_INJECTION = f"""
+<script id="mikazuki-ui-settings-about-cleanup">
+(function () {{
+  if (window.__MIKAZUKI_UI_SETTINGS_ABOUT_CLEANUP__) return;
+  window.__MIKAZUKI_UI_SETTINGS_ABOUT_CLEANUP__ = true;
+
+  var ISSUE_TARGET_URL = {json.dumps(ABOUT_ISSUE_TARGET_URL)};
+  var UI_SETTINGS_PATH_RE = /^\\/other\\/settings(?:\\.(?:html|md))?\\/?$/i;
+  var ABOUT_PATH_RE = /^\\/other\\/about(?:\\.(?:html|md))?\\/?$/i;
+  var UI_SETTINGS_LINK_RE = /\\/other\\/settings\\.md$/i;
+  var UI_SETTINGS_LABEL_RE = /^ui\\s*设置$/i;
+
+  function pathname() {{
+    return (window.location && window.location.pathname) ? String(window.location.pathname) : "";
+  }}
+
+  function isUiSettingsPage() {{
+    return UI_SETTINGS_PATH_RE.test(pathname());
+  }}
+
+  function isAboutPage() {{
+    return ABOUT_PATH_RE.test(pathname());
+  }}
+
+  function maybeRedirectUiSettings() {{
+    if (!isUiSettingsPage()) return false;
+    if (pathname() !== "/other/about.html") {{
+      window.location.replace("/other/about.html");
+    }}
+    return true;
+  }}
+
+  function removeUiSettingsSidebarEntries(root) {{
+    var scope = root || document;
+    var links = scope.querySelectorAll("a.sidebar-item");
+    for (var i = 0; i < links.length; i++) {{
+      var a = links[i];
+      var href = (a.getAttribute("href") || "").trim();
+      var label = (a.textContent || "").trim();
+      if (!UI_SETTINGS_LINK_RE.test(href) && !UI_SETTINGS_LABEL_RE.test(label)) continue;
+      var li = a.closest("li");
+      if (li && li.parentNode) {{
+        li.parentNode.removeChild(li);
+      }}
+    }}
+  }}
+
+  function cleanupEmptySidebarChildren() {{
+    var groups = document.querySelectorAll("ul.sidebar-item-children");
+    for (var i = 0; i < groups.length; i++) {{
+      var ul = groups[i];
+      if (ul.querySelector("li")) continue;
+      var parentLi = ul.closest("li");
+      if (parentLi && parentLi.parentNode) {{
+        parentLi.parentNode.removeChild(parentLi);
+      }}
+    }}
+  }}
+
+  function rewriteAboutIssueLink(root) {{
+    if (!isAboutPage()) return;
+    if (!ISSUE_TARGET_URL) return;
+    var scope = root || document;
+    var anchors = scope.querySelectorAll(".theme-default-content a[href], main a[href]");
+    for (var i = 0; i < anchors.length; i++) {{
+      var a = anchors[i];
+      var href = String(a.getAttribute("href") || "").trim();
+      var text = String(a.textContent || "").trim().toLowerCase();
+      var looksLikeIssueLink = /github\\.com\\/[^/]+\\/[^/]+\\/issues/i.test(href);
+      if (!looksLikeIssueLink && text !== "issue") continue;
+      if (href === ISSUE_TARGET_URL) continue;
+      a.setAttribute("href", ISSUE_TARGET_URL);
+    }}
+  }}
+
+  function removeAboutContacts(root) {{
+    if (!isAboutPage()) return;
+    var scope = root || document;
+    var contentRoot =
+      scope.querySelector(".theme-default-content > div") ||
+      scope.querySelector(".theme-default-content") ||
+      scope.querySelector("main");
+    if (!contentRoot) return;
+
+    var headings = contentRoot.querySelectorAll("h2, h3");
+    for (var i = 0; i < headings.length; i++) {{
+      var h = headings[i];
+      var title = String(h.textContent || "").replace(/\\s+/g, "");
+      if (title !== "联系方式") continue;
+
+      var next = h.nextElementSibling;
+      h.remove();
+      while (next) {{
+        if (next.tagName === "H2" || next.tagName === "H3") break;
+        var current = next;
+        next = next.nextElementSibling;
+        current.remove();
+      }}
+      break;
+    }}
+
+    var paragraphs = contentRoot.querySelectorAll("p");
+    for (var j = 0; j < paragraphs.length; j++) {{
+      var p = paragraphs[j];
+      var text = String(p.textContent || "").toLowerCase();
+      if (text.includes("邮箱") || text.includes("discord")) {{
+        p.remove();
+      }}
+    }}
+  }}
+
+  function tick() {{
+    if (maybeRedirectUiSettings()) return;
+    removeUiSettingsSidebarEntries(document);
+    cleanupEmptySidebarChildren();
+    rewriteAboutIssueLink(document);
+    removeAboutContacts(document);
+  }}
+
+  tick();
+  var observer = new MutationObserver(function () {{ tick(); }});
+  observer.observe(document.documentElement, {{ childList: true, subtree: true }});
+  window.addEventListener("load", tick);
+  setInterval(tick, 400);
+}})();
+</script>
+"""
+
 _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
 <script id="mikazuki-tensorboard-runs-default">
 (function () {
@@ -1512,6 +1696,20 @@ def _inject_hide_deprecated_lora_docs(html_content: str) -> str:
     return _HIDE_DEPRECATED_LORA_DOCS_INJECTION + "\n" + html_content
 
 
+def _inject_ui_settings_about_cleanup(html_content: str) -> str:
+    if 'id="mikazuki-ui-settings-about-cleanup"' in html_content:
+        return html_content
+
+    module_tag = '<script type="module"'
+    if module_tag in html_content:
+        return html_content.replace(module_tag, _UI_SETTINGS_ABOUT_CLEANUP_INJECTION + "\n" + module_tag, 1)
+
+    if "</head>" in html_content:
+        return html_content.replace("</head>", _UI_SETTINGS_ABOUT_CLEANUP_INJECTION + "\n</head>", 1)
+
+    return _UI_SETTINGS_ABOUT_CLEANUP_INJECTION + "\n" + html_content
+
+
 def _inject_tensorboard_runs_default(html_content: str) -> str:
     if 'id="mikazuki-tensorboard-runs-default"' in html_content:
         return html_content
@@ -1588,6 +1786,7 @@ def _get_patched_frontend_html_content(request_path: str) -> str | None:
 
     content = _inject_schema_bootstrap(content)
     content = _inject_hide_deprecated_lora_docs(content)
+    content = _inject_ui_settings_about_cleanup(content)
     content = _inject_tensorboard_runs_default(content)
     content = _inject_ctrl_s_save_config(content)
     content = _inject_worker_mode_guard(content)

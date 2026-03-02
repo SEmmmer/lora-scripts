@@ -67,8 +67,9 @@
                 full_fp16: Schema.boolean().description("完全使用 FP16 精度"),
                 full_bf16: Schema.boolean().description("完全使用 BF16 精度"),
                 no_half_vae: Schema.boolean().description("不使用半精度 VAE"),
-                xformers: Schema.boolean().default(true).description("启用 xformers"),
-                sdpa: Schema.boolean().description("启用 sdpa"),
+                xformers: Schema.boolean().default(true).description("启用 xformers（通常更省显存/更快，但兼容性不如 sdpa；与 sdpa 同开时优先 xformers）"),
+                sdpa: Schema.boolean().description("启用 sdpa（PyTorch 原生，稳定性更好；速度/显存通常略逊于 xformers；当 xformers 不可用时作为回退）"),
+                xformers_vae_fallback: Schema.boolean().description("尝试 bf16 VAE xformers（失败自动回退默认 attention 并输出 warning）；关闭则不尝试"),
                 lowram: Schema.boolean().default(false).description("低内存模式 该模式下会将 U-net、文本编码器、VAE 直接加载到显存中"),
                 cache_latents: Schema.boolean().default(true).description("缓存图像 latent, 缓存 VAE 输出以减少 VRAM 使用"),
                 cache_latents_to_disk: Schema.boolean().default(true).description("缓存图像 latent 到磁盘"),
@@ -243,23 +244,6 @@
             ]),
         ]),
 
-        LOG_SETTINGS: Schema.intersect([
-            Schema.object({
-                log_with: Schema.union(["tensorboard", "wandb"]).default("tensorboard").description("日志模块"),
-                log_prefix: Schema.string().description("日志前缀"),
-                log_tracker_name: Schema.string().description("日志追踪器名称"),
-                logging_dir: Schema.string().default("./logs").description("日志保存文件夹"),
-            }).description('日志设置'),
-
-            Schema.union([
-                Schema.object({
-                    log_with: Schema.const("wandb").required(),
-                    wandb_api_key: Schema.string().required().description("wandb 的 api 密钥"),
-                }),
-                Schema.object({}),
-            ]),
-        ]),
-
         NOISE_SETTINGS: Schema.object({
             noise_offset: Schema.number().step(0.01).description("在训练中添加噪声偏移来改良生成非常暗或者非常亮的图像，如果启用推荐为 0.1"),
             multires_noise_iterations: Schema.number().step(1).description("多分辨率（金字塔）噪声迭代次数 推荐 6-10。无法与 noise_offset 一同启用"),
@@ -291,7 +275,7 @@
             gloo_socket_ifname: createIfnameSchema("enp11s0").description("GLOO 通信网卡名（启动时读取本机网卡并标注速率）"),
             sync_from_main_settings: Schema.object({
                 sync_config_from_main: Schema.boolean().default(true).description("从机启动前从主机同步关键训练参数"),
-                sync_config_keys_from_main: Schema.string().default("train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024").description("从主机同步的参数键名，逗号分隔"),
+                sync_config_keys_from_main: Schema.string().default("train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,xformers_vae_fallback,staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024").description("从主机同步的参数键名，逗号分隔"),
                 sync_missing_assets_from_main: Schema.boolean().default(true).description("从机若缺少底模/数据集/resume 等路径时，从主机复制到本地同路径"),
                 sync_asset_keys: Schema.string().default("pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume").description("需要检查并按需同步的路径键名，逗号分隔"),
                 sync_main_repo_dir: Schema.string().default(SYNC_MAIN_REPO_DIR_DEFAULT).description("主机仓库根目录（用于解析相对路径）"),

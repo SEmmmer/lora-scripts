@@ -47,7 +47,6 @@ WORKER_REQUIRED_SYNC_ASSET_KEYS = ("resume",)
 MODEL_TRAIN_TYPE_TO_TRAINER_FILE = {
     "sd-lora": "./scripts/stable/train_network.py",
     "sdxl-lora": "./scripts/stable/sdxl_train_network.py",
-    "sdxl-finetune": "./scripts/stable/sdxl_train.py",
 }
 WORKER_OUTPUT_MARKER = "THIS_IS_WORKER_NODE_CHECK_MAIN_OUTPUTS"
 DATASET_DIR_KEYS = ("train_data_dir", "reg_data_dir")
@@ -862,14 +861,15 @@ def _resolve_remote_path(path_value: str, remote_repo_root: str) -> str:
 
 
 def _is_tensorboard_logging_enabled(config: dict) -> bool:
-    logging_dir = str(config.get("logging_dir", "") or "").strip()
-    if not logging_dir:
-        return False
+    output_dir = str(config.get("output_dir", "") or "").strip()
+    return bool(output_dir)
 
-    log_with = config.get("log_with")
-    if log_with is None:
-        return True
-    return str(log_with).strip().lower() in {"tensorboard", "all"}
+
+def _resolve_tensorboard_logging_root(config: dict, repo_root: Path) -> Optional[Path]:
+    output_dir = str(config.get("output_dir", "") or "").strip()
+    if not output_dir:
+        return None
+    return _resolve_local_path(output_dir, repo_root)
 
 
 def _sanitize_tensorboard_component(value: str) -> str:
@@ -879,10 +879,9 @@ def _sanitize_tensorboard_component(value: str) -> str:
 
 
 def _resolve_tensorboard_model_name(config: dict) -> str:
-    for key in ("output_name", "log_prefix"):
-        value = str(config.get(key, "") or "").strip()
-        if value:
-            return _sanitize_tensorboard_component(value)
+    value = str(config.get("output_name", "") or "").strip()
+    if value:
+        return _sanitize_tensorboard_component(value)
     return "model"
 
 
@@ -916,6 +915,15 @@ def _read_resume_tensorboard_dir_from_state(config: dict, repo_root: Path) -> Op
     logging_dir_path = Path(logging_dir.strip()).expanduser()
     if not logging_dir_path.is_absolute():
         logging_dir_path = (repo_root / logging_dir_path).resolve()
+    if not logging_dir_path.exists() or not logging_dir_path.is_dir():
+        return None
+
+    output_root = _resolve_tensorboard_logging_root(config, repo_root)
+    if output_root is not None:
+        try:
+            logging_dir_path.relative_to(output_root)
+        except ValueError:
+            return None
     return logging_dir_path
 
 
@@ -970,7 +978,9 @@ def _resolve_tensorboard_run_dir_from_config(config: dict, repo_root: Path) -> O
     if not _is_tensorboard_logging_enabled(config):
         return None
 
-    logging_root = _resolve_local_path(str(config.get("logging_dir", "./logs") or "./logs"), repo_root)
+    logging_root = _resolve_tensorboard_logging_root(config, repo_root)
+    if logging_root is None:
+        return None
     model_name = _resolve_tensorboard_model_name(config)
 
     resume_logging_dir = _read_resume_tensorboard_dir_from_state(config, repo_root)
@@ -984,6 +994,34 @@ def _resolve_tensorboard_run_dir_from_config(config: dict, repo_root: Path) -> O
             return latest_run
 
     return _build_next_tensorboard_run(logging_root, model_name)
+
+
+def _enforce_tb_only_config(config: dict) -> bool:
+    if not isinstance(config, dict):
+        return False
+
+    changed = False
+    output_dir = str(config.get("output_dir", "./output") or "./output").strip()
+    if not output_dir:
+        output_dir = "./output"
+    if config.get("output_dir") != output_dir:
+        config["output_dir"] = output_dir
+        changed = True
+
+    if config.get("log_with") != "tensorboard":
+        config["log_with"] = "tensorboard"
+        changed = True
+
+    if config.get("logging_dir") != output_dir:
+        config["logging_dir"] = output_dir
+        changed = True
+
+    for key in ("wandb_api_key", "wandb_run_name", "log_tracker_config", "log_prefix", "log_tracker_name"):
+        if key in config:
+            config.pop(key, None)
+            changed = True
+
+    return changed
 
 
 def _snapshot_tensorboard_event_files(run_dir: Optional[Path]) -> dict:
@@ -1779,6 +1817,10 @@ def run_train(toml_path: str,
     runtime_train_config = {}
     try:
         runtime_train_config = toml.load(toml_path)
+        if _enforce_tb_only_config(runtime_train_config):
+            with open(toml_path, "w", encoding="utf-8") as f:
+                toml.dump(runtime_train_config, f)
+            log.info("[tensorboard] forced TB-only logging and set logging_dir to output_dir for this run")
     except Exception as e:
         log.warning(f"[runtime-config] failed to parse training config before launch: {toml_path} ({e})")
 

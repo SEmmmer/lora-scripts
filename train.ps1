@@ -72,11 +72,6 @@ $conv_dim = 4
 $conv_alpha = 4
 $dropout = "0"
 
-# Remote logging
-$use_wandb = 0
-$wandb_api_key = ""
-$log_tracker_name = ""
-
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
@@ -166,22 +161,14 @@ if ($stop_text_encoder_training -ne 0) { [void]$ext_args.Add("--stop_text_encode
 if ($noise_offset -ne 0) { [void]$ext_args.Add("--noise_offset=$noise_offset") }
 if ($min_snr_gamma -ne 0) { [void]$ext_args.Add("--min_snr_gamma=$min_snr_gamma") }
 
-if ($use_wandb -eq 1) {
-    [void]$ext_args.Add("--log_with=all")
-    if ($wandb_api_key) { [void]$ext_args.Add("--wandb_api_key=$wandb_api_key") }
-    if ($log_tracker_name) { [void]$ext_args.Add("--log_tracker_name=$log_tracker_name") }
-}
-else {
-    [void]$ext_args.Add("--log_with=tensorboard")
-}
+[void]$ext_args.Add("--log_with=tensorboard")
 
 & $pythonBin -m accelerate.commands.launch @launch_args --num_cpu_threads_per_process=4 $trainer_file `
     --enable_bucket `
     --pretrained_model_name_or_path=$pretrained_model `
     --train_data_dir=$train_data_dir `
     --output_dir="./output" `
-    --logging_dir="./logs" `
-    --log_prefix=$output_name `
+    --logging_dir="./output" `
     --resolution=$resolution `
     --network_module=$network_module `
     --max_train_epochs=$max_train_epoches `

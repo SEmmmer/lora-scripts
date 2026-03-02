@@ -47,7 +47,12 @@ avaliable_presets = []
 trainer_mapping = {
     "sd-lora": "./scripts/stable/train_network.py",
     "sdxl-lora": "./scripts/stable/sdxl_train_network.py",
-    "sdxl-finetune": "./scripts/stable/sdxl_train.py",
+}
+
+WEBUI_SCHEMA_ALLOWLIST = {
+    "shared.ts",
+    "lora-master.ts",
+    "tagger.ts",
 }
 
 
@@ -101,10 +106,14 @@ async def load_schemas():
     avaliable_schemas.clear()
 
     schema_dir = os.path.join(os.getcwd(), "mikazuki", "schema")
-    schemas = [
+    all_schemas = [
         name for name in os.listdir(schema_dir)
         if name.lower().endswith(".ts") and os.path.isfile(os.path.join(schema_dir, name))
     ]
+    schemas = [name for name in all_schemas if name in WEBUI_SCHEMA_ALLOWLIST]
+    skipped_schemas = sorted(name for name in all_schemas if name not in WEBUI_SCHEMA_ALLOWLIST)
+    if skipped_schemas:
+        log.info(f"Skip non-WebUI schemas: {', '.join(skipped_schemas)}")
     schemas.sort(key=lambda name: (0 if name == "shared.ts" else 1, name.lower()))
     network_interface_options = _get_network_interface_options()
     detected_repo_root = os.getcwd()
@@ -224,7 +233,7 @@ async def create_toml_file(request: Request):
         "sync_use_password_auth": pop_sync_value("sync_use_password_auth", True),
         "sync_ssh_password": pop_sync_value("sync_ssh_password", ""),
         "sync_config_from_main": pop_sync_value("sync_config_from_main", True),
-        "sync_config_keys_from_main": pop_sync_value("sync_config_keys_from_main", "train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024"),
+        "sync_config_keys_from_main": pop_sync_value("sync_config_keys_from_main", "train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,xformers_vae_fallback,staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024"),
         "sync_missing_assets_from_main": pop_sync_value("sync_missing_assets_from_main", True),
         "sync_asset_keys": pop_sync_value("sync_asset_keys", "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"),
         "sync_main_repo_dir": pop_sync_value("sync_main_repo_dir", os.getcwd()),
@@ -244,7 +253,7 @@ async def create_toml_file(request: Request):
         supported = ", ".join(sorted(trainer_mapping.keys()))
         return APIResponseFail(message=f"不支持的训练类型: {model_train_type}。当前支持: {supported}")
 
-    if model_train_type != "sdxl-finetune" and not skip_local_path_validation:
+    if not skip_local_path_validation:
         if not train_utils.validate_data_dir(config["train_data_dir"]):
             return APIResponseFail(message="训练数据集路径不存在或没有图片，请检查目录。")
 
@@ -275,6 +284,14 @@ async def create_toml_file(request: Request):
 
     # Keep training type in autosave so worker can sync and choose the same trainer script.
     config["model_train_type"] = model_train_type
+
+    # Force TB-only logging in UI/API path.
+    output_dir = str(config.get("output_dir", "./output") or "./output").strip() or "./output"
+    config["output_dir"] = output_dir
+    config["log_with"] = "tensorboard"
+    config["logging_dir"] = output_dir
+    for key in ("wandb_api_key", "wandb_run_name", "log_tracker_config", "log_prefix", "log_tracker_name"):
+        config.pop(key, None)
 
     with open(toml_file, "w", encoding="utf-8") as f:
         f.write(toml.dumps(config))

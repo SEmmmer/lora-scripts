@@ -11,4 +11,4 @@ if (-not (Test-Path $pythonPath)) {
 }
 $pythonBin = (Resolve-Path $pythonPath).Path
 
-& $pythonBin -m mikazuki.tensorboard_launcher --logdir logs --host 127.0.0.1 --port 6006 @args
+& $pythonBin -m mikazuki.tensorboard_launcher --logdir output --host 127.0.0.1 --port 6006 @args

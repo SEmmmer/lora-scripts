@@ -48,6 +48,25 @@ get_python_major_minor() {
   "$python_bin" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
 }
 
+check_binary_requirements() {
+  local wheel_check_dir check_log
+  wheel_check_dir="$script_dir/.pip-wheel-check"
+  check_log="$wheel_check_dir/download.log"
+
+  rm -rf "$wheel_check_dir"
+  mkdir -p "$wheel_check_dir"
+
+  echo "Checking wheel availability for requirements (no local builds)..."
+  if ! "$PYTHON_BIN" -m pip download --dest "$wheel_check_dir" --only-binary=:all: -r requirements.txt >"$check_log" 2>&1; then
+    echo "Binary wheel precheck failed. To avoid local compilation, installation is stopped."
+    grep -E "Could not find a version that satisfies the requirement|No matching distribution found for" "$check_log" || cat "$check_log"
+    rm -rf "$wheel_check_dir"
+    exit 1
+  fi
+
+  rm -rf "$wheel_check_dir"
+}
+
 install_uv() {
   if [[ -x "$UV_BIN" ]]; then
     return
@@ -188,7 +207,11 @@ cuda_major_version="$(echo "$cuda_version" | awk -F'.' '{print $1}')"
 cuda_minor_version="$(echo "$cuda_version" | awk -F'.' '{print $2}')"
 echo "CUDA Version: $cuda_version"
 
-if (( cuda_major_version >= 12 )); then
+if (( cuda_major_version >= 13 )); then
+  echo "Installing torch 2.10.0+cu130"
+  "$PYTHON_BIN" -m pip install torch==2.10.0+cu130 torchvision==0.25.0+cu130 --extra-index-url https://download.pytorch.org/whl/cu130
+  "$PYTHON_BIN" -m pip install --no-deps xformers==0.0.35 --extra-index-url https://download.pytorch.org/whl/cu130
+elif (( cuda_major_version >= 12 )); then
   echo "Installing torch 2.10.0+cu128"
   "$PYTHON_BIN" -m pip install torch==2.10.0+cu128 torchvision==0.25.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
   "$PYTHON_BIN" -m pip install --no-deps xformers==0.0.35 --extra-index-url https://download.pytorch.org/whl/cu128
@@ -211,6 +234,7 @@ else
   exit 1
 fi
 
+check_binary_requirements
 echo "Installing deps..."
-"$PYTHON_BIN" -m pip install --upgrade -r requirements.txt
+"$PYTHON_BIN" -m pip install --upgrade --only-binary=:all: -r requirements.txt
 echo "Install completed"

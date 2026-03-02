@@ -76,9 +76,6 @@ Schema.intersect([
     // 预览图设置
     SHARED_SCHEMAS.PREVIEW_IMAGE,
 
-    // 日志设置
-    SHARED_SCHEMAS.LOG_SETTINGS,
-
     // caption 选项
     Schema.object(SHARED_SCHEMAS.RAW.CAPTION_SETTINGS).description("caption（Tag）选项"),
 

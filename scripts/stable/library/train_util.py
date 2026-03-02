@@ -112,6 +112,7 @@ GPU_POWER_SLIDING_WINDOW_SEC = 30.0
 MESH_NET_QUERY_INTERVAL_SEC = 1.0
 MESH_NET_SLIDING_WINDOW_SEC = 30.0
 MESH_NET_IFACE_ENV = "MIKAZUKI_MESH_NET_IFACE"
+_sample_tb_log_failure_reported = False
 
 
 class GPUPowerAverager:
@@ -120,8 +121,9 @@ class GPUPowerAverager:
     def __init__(self, sample_interval_sec: float = GPU_POWER_QUERY_INTERVAL_SEC, sliding_window_sec: float = GPU_POWER_SLIDING_WINDOW_SEC):
         self.sample_interval_sec = max(0.1, float(sample_interval_sec))
         self.sliding_window_sec = max(1.0, float(sliding_window_sec))
-        self.snapshot_samples = deque()  # [(timestamp_sec, power_w)]
+        self.snapshot_samples = deque()  # [(timestamp_sec, power_w, vram_used_mb)]
         self.cached_power_w = None
+        self.cached_vram_used_mb = None
         self.device_ids = self._parse_visible_device_ids()
         self.available = True
         self._lock = threading.Lock()
@@ -144,8 +146,15 @@ class GPUPowerAverager:
             result.append(int(token))
         return result if result else None
 
-    def _query_snapshot_power_w(self):
-        cmd = ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"]
+    @staticmethod
+    def _parse_smi_float(token: str):
+        try:
+            return float(str(token).strip())
+        except Exception:
+            return None
+
+    def _query_snapshot_metrics(self):
+        cmd = ["nvidia-smi", "--query-gpu=power.draw,memory.used", "--format=csv,noheader,nounits"]
         if self.device_ids:
             cmd.extend(["-i", ",".join(str(i) for i in self.device_ids)])
         try:
@@ -165,55 +174,80 @@ class GPUPowerAverager:
             self.available = False
             return None
 
-        values = []
+        power_values = []
+        vram_values = []
         for line in str(proc.stdout or "").splitlines():
-            token = line.strip()
-            if not token:
+            tokens = [part.strip() for part in line.split(",")]
+            if not tokens:
                 continue
-            try:
-                values.append(float(token))
-            except Exception:
-                continue
-        if not values:
+            power_value = self._parse_smi_float(tokens[0]) if len(tokens) >= 1 else None
+            vram_value = self._parse_smi_float(tokens[1]) if len(tokens) >= 2 else None
+            if power_value is not None:
+                power_values.append(power_value)
+            if vram_value is not None:
+                vram_values.append(vram_value)
+
+        if not power_values and not vram_values:
             return None
-        return float(sum(values) / len(values))
+
+        average_power_w = float(sum(power_values) / len(power_values)) if power_values else None
+        average_vram_used_mb = float(sum(vram_values) / len(vram_values)) if vram_values else None
+        return average_power_w, average_vram_used_mb
 
     def _trim_locked(self, now_ts: float):
         cutoff_ts = now_ts - self.sliding_window_sec
         while self.snapshot_samples and self.snapshot_samples[0][0] < cutoff_ts:
             self.snapshot_samples.popleft()
 
-    def _add_sample(self, ts: float, power_w: float):
+    def _add_sample(self, ts: float, power_w: Optional[float], vram_used_mb: Optional[float]):
         with self._lock:
-            self.snapshot_samples.append((float(ts), float(power_w)))
+            self.snapshot_samples.append(
+                (
+                    float(ts),
+                    float(power_w) if power_w is not None else None,
+                    float(vram_used_mb) if vram_used_mb is not None else None,
+                )
+            )
             self._trim_locked(float(ts))
 
     def _sampling_loop(self):
         # Keep sampling frequency independent from training step duration.
         while not self._stop_event.is_set() and self.available:
             start_ts = time.time()
-            snapshot = self._query_snapshot_power_w()
+            snapshot = self._query_snapshot_metrics()
             now_ts = time.time()
             if snapshot is not None:
-                self._add_sample(now_ts, float(snapshot))
+                self._add_sample(now_ts, snapshot[0], snapshot[1])
             elapsed = max(0.0, now_ts - start_ts)
             sleep_sec = max(0.0, self.sample_interval_sec - elapsed)
             if self._stop_event.wait(timeout=sleep_sec):
                 break
 
-    def get_average_power_w(self):
+    def get_average_metrics(self):
         if not self.available:
-            return None
+            return None, None
+
         now = time.time()
         with self._lock:
             self._trim_locked(now)
             if not self.snapshot_samples:
-                return self.cached_power_w
-            values = [item[1] for item in self.snapshot_samples]
-        if not values:
-            return self.cached_power_w
-        self.cached_power_w = float(sum(values) / len(values))
-        return self.cached_power_w
+                return self.cached_power_w, self.cached_vram_used_mb
+            power_values = [sample[1] for sample in self.snapshot_samples if sample[1] is not None]
+            vram_values = [sample[2] for sample in self.snapshot_samples if sample[2] is not None]
+
+        if power_values:
+            self.cached_power_w = float(sum(power_values) / len(power_values))
+        if vram_values:
+            self.cached_vram_used_mb = float(sum(vram_values) / len(vram_values))
+        return self.cached_power_w, self.cached_vram_used_mb
+
+    def get_average_power_w(self):
+        power_w, _ = self.get_average_metrics()
+        return power_w
+
+    def get_average_vram_used_mb(self):
+        _, vram_used_mb = self.get_average_metrics()
+        return vram_used_mb
 
     def close(self):
         self._stop_event.set()
@@ -221,12 +255,41 @@ class GPUPowerAverager:
             self._sampler_thread.join(timeout=0.5)
 
 
-def append_gpu_power_to_logs(logs: dict, power_averager: Optional[GPUPowerAverager]):
+def append_gpu_power_to_logs(logs: dict, power_averager: Optional[GPUPowerAverager], compact_for_postfix: bool = False):
     if power_averager is None:
         return logs
-    power_w = power_averager.get_average_power_w()
+    power_w, vram_used_mb = power_averager.get_average_metrics()
     if power_w is not None:
         logs["gpu_power_avg_w"] = round(float(power_w), 1)
+    if vram_used_mb is not None:
+        logs["gpu_vram_used_mb"] = int(round(float(vram_used_mb)))
+
+    if compact_for_postfix:
+        power_value = logs.get("gpu_power_avg_w")
+        vram_value = logs.get("gpu_vram_used_mb")
+        if vram_value is not None:
+            vram_text = f"{int(vram_value):,}MB"
+            if power_value is not None:
+                if isinstance(power_value, (int, float)):
+                    power_text = f"{float(power_value):.1f}W"
+                else:
+                    power_text = str(power_value).strip()
+                logs["gpu_power_avg_w"] = f"{power_text} {vram_text}".strip()
+            else:
+                logs["gpu_power_avg_w"] = vram_text
+            logs.pop("gpu_vram_used_mb", None)
+
+    return logs
+
+
+def append_gpu_metrics_to_tensorboard_logs(logs: dict, power_averager: Optional[GPUPowerAverager]):
+    if power_averager is None:
+        return logs
+    power_w, vram_used_mb = power_averager.get_average_metrics()
+    if power_w is not None:
+        logs["gpu/power_avg_w"] = round(float(power_w), 1)
+    if vram_used_mb is not None:
+        logs["gpu/vram_used_mb"] = int(round(float(vram_used_mb)))
     return logs
 
 
@@ -3122,29 +3185,20 @@ def resolve_attention_backend(mem_eff_attn, xformers, sdpa):
         return mem_eff_attn, False, fallback_sdpa
 
     reason = None
+    # Probe xformers kernel directly instead of applying GPU capability blacklists.
     try:
-        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    except Exception:
-        major, minor = torch.cuda.get_device_capability()
+        import xformers.ops as xops
 
-    if major >= 12:
-        # Current public xformers wheels are often behind newest GPU architectures.
-        reason = f"unsupported GPU compute capability {major}.{minor}"
-
-    if reason is None:
-        try:
-            import xformers.ops as xops
-
-            q = torch.randn((1, 8, 1, 64), device="cuda", dtype=torch.float16)
-            with torch.no_grad():
-                _ = xops.memory_efficient_attention(q, q, q, attn_bias=None)
-        except Exception as e:
-            reason = f"{type(e).__name__}: {e}"
-        finally:
-            if "q" in locals():
-                del q
-            if "_" in locals():
-                del _
+        q = torch.randn((1, 8, 1, 64), device="cuda", dtype=torch.float16)
+        with torch.no_grad():
+            _ = xops.memory_efficient_attention(q, q, q, attn_bias=None)
+    except Exception as e:
+        reason = f"{type(e).__name__}: {e}"
+    finally:
+        if "q" in locals():
+            del q
+        if "_" in locals():
+            del _
 
     if reason is not None:
         fallback_sdpa = sdpa or not mem_eff_attn
@@ -3169,6 +3223,42 @@ def replace_unet_modules(unet: UNet2DConditionModel, mem_eff_attn, xformers, sdp
     elif sdpa:
         logger.info("Enable SDPA for U-Net")
         unet.set_use_sdpa(True)
+
+
+def try_set_vae_memory_efficient_attention_xformers(
+    vae,
+    enable_xformers: bool,
+    try_bf16_with_fallback: bool = False,
+) -> bool:
+    if not enable_xformers:
+        logger.info("Skip VAE xformers because xformers is disabled for this run")
+        return False
+
+    if not try_bf16_with_fallback:
+        logger.info(
+            "xformers_vae_fallback is disabled: do not try bf16 VAE xformers; use default VAE attention"
+        )
+        return False
+
+    logger.info(
+        "xformers_vae_fallback is enabled: try bf16 VAE xformers; fallback to default VAE attention on failure"
+    )
+
+    try:
+        vae.set_use_memory_efficient_attention_xformers(True)
+        logger.info("Enable xformers for VAE")
+        return True
+    except Exception as e:
+        reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+        logger.warning(
+            f"xformers is disabled automatically for VAE ({type(e).__name__}: {reason}); "
+            "fallback to default VAE attention because xformers_vae_fallback is enabled"
+        )
+        try:
+            vae.set_use_memory_efficient_attention_xformers(False)
+        except Exception:
+            pass
+        return False
 
 
 """
@@ -3609,6 +3699,11 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="use sdpa for CrossAttention (requires PyTorch 2.0) / CrossAttentionにsdpaを使う（PyTorch 2.0が必要）",
     )
     parser.add_argument(
+        "--xformers_vae_fallback",
+        action="store_true",
+        help="try bf16 VAE xformers and fallback to default VAE attention on failure / bf16のVAE xformersを試し、失敗時はデフォルトattentionへフォールバックする",
+    )
+    parser.add_argument(
         "--vae",
         type=str,
         default=None,
@@ -3682,41 +3777,35 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--logging_dir",
         type=str,
         default=None,
-        help="enable logging and output TensorBoard log to this directory / ログ出力を有効にしてこのディレクトリにTensorBoard用のログを出力する",
+        help=argparse.SUPPRESS,  # fixed to output_dir for TB-only mode
     )
     parser.add_argument(
         "--log_with",
         type=str,
-        default=None,
-        choices=["tensorboard", "wandb", "all"],
-        help="what logging tool(s) to use (if 'all', TensorBoard and WandB are both used) / ログ出力に使用するツール (allを指定するとTensorBoardとWandBの両方が使用される)",
+        default="tensorboard",
+        choices=["tensorboard"],
+        help=argparse.SUPPRESS,  # TB-only mode
     )
     parser.add_argument(
-        "--log_prefix", type=str, default=None, help="add prefix for each log directory / ログディレクトリ名の先頭に追加する文字列"
+        "--log_prefix", type=str, default=None, help=argparse.SUPPRESS
     )
     parser.add_argument(
         "--log_tracker_name",
         type=str,
         default=None,
-        help="name of tracker to use for logging, default is script-specific default name / ログ出力に使用するtrackerの名前、省略時はスクリプトごとのデフォルト名",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--wandb_run_name",
         type=str,
         default=None,
-        help="The name of the specific wandb session / wandb ログに表示される特定の実行の名前",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--log_tracker_config",
         type=str,
         default=None,
-        help="path to tracker config file to use for logging / ログ出力に使用するtrackerの設定ファイルのパス",
-    )
-    parser.add_argument(
-        "--wandb_api_key",
-        type=str,
-        default=None,
-        help="specify WandB API key to log in before starting training (optional). / WandB APIキーを指定して学習開始前にログインする（オプション）",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--log_config", action="store_true", help="log training configuration / 学習設定をログに出力する")
 
@@ -3930,13 +4019,12 @@ def add_masked_loss_arguments(parser: argparse.ArgumentParser):
 
 def get_sanitized_config_or_none(args: argparse.Namespace):
     # if `--log_config` is enabled, return args for logging. if not, return None.
-    # when `--log_config is enabled, filter out sensitive values from args
-    # if wandb is not enabled, the log is not exposed to the public, but it is fine to filter out sensitive values to be safe
+    # filter out sensitive values from args.
 
     if not args.log_config:
         return None
 
-    sensitive_args = ["wandb_api_key", "huggingface_token"]
+    sensitive_args = ["huggingface_token"]
     sensitive_path_args = [
         "pretrained_model_name_or_path",
         "vae",
@@ -3964,58 +4052,9 @@ def get_sanitized_config_or_none(args: argparse.Namespace):
     return filtered_args
 
 
-# verify command line args for training
 def verify_command_line_training_args(args: argparse.Namespace):
-    # if wandb is enabled, the command line is exposed to the public
-    # check whether sensitive options are included in the command line arguments
-    # if so, warn or inform the user to move them to the configuration file
-    # wandbが有効な場合、コマンドラインが公開される
-    # 学習用のコマンドライン引数に敏感なオプションが含まれているかどうかを確認し、
-    # 含まれている場合は設定ファイルに移動するようにユーザーに警告または通知する
-
-    wandb_enabled = args.log_with is not None and args.log_with != "tensorboard"  # "all" or "wandb"
-    if not wandb_enabled:
-        return
-
-    sensitive_args = ["wandb_api_key", "huggingface_token"]
-    sensitive_path_args = [
-        "pretrained_model_name_or_path",
-        "vae",
-        "tokenizer_cache_dir",
-        "train_data_dir",
-        "conditioning_data_dir",
-        "reg_data_dir",
-        "output_dir",
-        "logging_dir",
-    ]
-
-    for arg in sensitive_args:
-        if getattr(args, arg, None) is not None:
-            logger.warning(
-                f"wandb is enabled, but option `{arg}` is included in the command line. Because the command line is exposed to the public, it is recommended to move it to the `.toml` file."
-                + f" / wandbが有効で、かつオプション `{arg}` がコマンドラインに含まれています。コマンドラインは公開されるため、`.toml`ファイルに移動することをお勧めします。"
-            )
-
-    # if path is absolute, it may include sensitive information
-    for arg in sensitive_path_args:
-        if getattr(args, arg, None) is not None and os.path.isabs(getattr(args, arg)):
-            logger.info(
-                f"wandb is enabled, but option `{arg}` is included in the command line and it is an absolute path. Because the command line is exposed to the public, it is recommended to move it to the `.toml` file or use relative path."
-                + f" / wandbが有効で、かつオプション `{arg}` がコマンドラインに含まれており、絶対パスです。コマンドラインは公開されるため、`.toml`ファイルに移動するか、相対パスを使用することをお勧めします。"
-            )
-
-    if getattr(args, "config_file", None) is not None:
-        logger.info(
-            f"wandb is enabled, but option `config_file` is included in the command line. Because the command line is exposed to the public, please be careful about the information included in the path."
-            + f" / wandbが有効で、かつオプション `config_file` がコマンドラインに含まれています。コマンドラインは公開されるため、パスに含まれる情報にご注意ください。"
-        )
-
-    # other sensitive options
-    if args.huggingface_repo_id is not None and args.huggingface_repo_visibility != "public":
-        logger.info(
-            f"wandb is enabled, but option huggingface_repo_id is included in the command line and huggingface_repo_visibility is not 'public'. Because the command line is exposed to the public, it is recommended to move it to the `.toml` file."
-            + f" / wandbが有効で、かつオプション huggingface_repo_id がコマンドラインに含まれており、huggingface_repo_visibility が 'public' ではありません。コマンドラインは公開されるため、`.toml`ファイルに移動することをお勧めします。"
-        )
+    # TB-only mode: no external tracker-specific command line checks.
+    return
 
 
 def verify_training_args(args: argparse.Namespace):
@@ -4311,7 +4350,7 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
         args_dict = vars(args)
 
         # remove unnecessary keys
-        for key in ["config_file", "output_config", "wandb_api_key"]:
+        for key in ["config_file", "output_config"]:
             if key in args_dict:
                 del args_dict[key]
 
@@ -5045,14 +5084,20 @@ def _sanitize_tensorboard_component(value: Optional[str]) -> str:
 
 
 def _resolve_tensorboard_model_name(args: argparse.Namespace) -> str:
-    # Prefer explicit output model name, then user-provided log_prefix.
-    for candidate in (getattr(args, "output_name", None), getattr(args, "log_prefix", None)):
-        if candidate is None:
-            continue
-        text = str(candidate).strip()
-        if text:
-            return _sanitize_tensorboard_component(text)
+    candidate = getattr(args, "output_name", None)
+    if candidate is None:
+        return "model"
+    text = str(candidate).strip()
+    if text:
+        return _sanitize_tensorboard_component(text)
     return "model"
+
+
+def _resolve_tensorboard_logging_root(args: argparse.Namespace) -> Optional[str]:
+    output_dir = str(getattr(args, "output_dir", "") or "").strip()
+    if not output_dir:
+        return None
+    return os.path.abspath(output_dir)
 
 
 def _read_resume_tensorboard_dir(args: argparse.Namespace) -> Optional[str]:
@@ -5081,6 +5126,18 @@ def _read_resume_tensorboard_dir(args: argparse.Namespace) -> Optional[str]:
     logging_dir = logging_dir.strip()
     if not os.path.isabs(logging_dir):
         logging_dir = os.path.abspath(logging_dir)
+    if not os.path.isdir(logging_dir):
+        return None
+
+    output_root = _resolve_tensorboard_logging_root(args)
+    if output_root:
+        try:
+            os.path.relpath(logging_dir, output_root)
+            common = os.path.commonpath([os.path.abspath(logging_dir), os.path.abspath(output_root)])
+            if common != os.path.abspath(output_root):
+                return None
+        except Exception:
+            return None
     return logging_dir
 
 
@@ -5136,53 +5193,32 @@ def prepare_accelerator(args: argparse.Namespace):
     this function also prepares deepspeed plugin
     """
 
-    if args.logging_dir is None:
-        logging_dir = None
-    else:
-        logging_root = os.path.abspath(args.logging_dir)
-        model_name = _resolve_tensorboard_model_name(args)
-        if getattr(args, "resume", None):
-            resume_logging_dir = _read_resume_tensorboard_dir(args)
-            if resume_logging_dir:
-                logging_dir = resume_logging_dir
-                logger.info(f"resume detected, reusing tensorboard dir from state: {logging_dir}")
-            else:
-                fallback_logging_dir = _find_latest_tensorboard_run(logging_root, model_name)
-                if fallback_logging_dir:
-                    logging_dir = fallback_logging_dir
-                    logger.info(f"resume detected, fallback to latest tensorboard dir: {logging_dir}")
-                else:
-                    logging_dir = _build_next_tensorboard_run(logging_root, model_name)
-                    logger.warning(
-                        f"resume detected but no previous tensorboard dir found, creating new run dir: {logging_dir}"
-                    )
-        else:
-            logging_dir = _build_next_tensorboard_run(logging_root, model_name)
-        setattr(args, "resolved_logging_dir", logging_dir)
-        os.environ["MIKAZUKI_EFFECTIVE_TENSORBOARD_DIR"] = logging_dir
+    logging_root = _resolve_tensorboard_logging_root(args)
+    if logging_root is None:
+        raise ValueError("output_dir is required for TensorBoard logging")
 
-    if args.log_with is None:
-        if logging_dir is not None:
-            log_with = "tensorboard"
+    model_name = _resolve_tensorboard_model_name(args)
+    if getattr(args, "resume", None):
+        resume_logging_dir = _read_resume_tensorboard_dir(args)
+        if resume_logging_dir:
+            logging_dir = resume_logging_dir
+            logger.info(f"resume detected, reusing tensorboard dir from state: {logging_dir}")
         else:
-            log_with = None
-    else:
-        log_with = args.log_with
-        if log_with in ["tensorboard", "all"]:
-            if logging_dir is None:
-                raise ValueError(
-                    "logging_dir is required when log_with is tensorboard / Tensorboardを使う場合、logging_dirを指定してください"
+            fallback_logging_dir = _find_latest_tensorboard_run(logging_root, model_name)
+            if fallback_logging_dir:
+                logging_dir = fallback_logging_dir
+                logger.info(f"resume detected, fallback to latest tensorboard dir: {logging_dir}")
+            else:
+                logging_dir = _build_next_tensorboard_run(logging_root, model_name)
+                logger.warning(
+                    f"resume detected but no previous tensorboard dir found, creating new run dir: {logging_dir}"
                 )
-        if log_with in ["wandb", "all"]:
-            try:
-                import wandb
-            except ImportError:
-                raise ImportError("No wandb / wandb がインストールされていないようです")
-            if logging_dir is not None:
-                os.makedirs(logging_dir, exist_ok=True)
-                os.environ["WANDB_DIR"] = logging_dir
-            if args.wandb_api_key is not None:
-                wandb.login(key=args.wandb_api_key)
+    else:
+        logging_dir = _build_next_tensorboard_run(logging_root, model_name)
+
+    setattr(args, "resolved_logging_dir", logging_dir)
+    os.environ["MIKAZUKI_EFFECTIVE_TENSORBOARD_DIR"] = logging_dir
+    log_with = "tensorboard"
 
     # torch.compile のオプション。 NO の場合は torch.compile は使わない
     dynamo_backend = "NO"
@@ -6352,19 +6388,36 @@ def sample_image_inference(
         num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
         seed_suffix = "" if seed is None else f"_{seed}"
         img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
-        image.save(os.path.join(save_dir, img_filename))
+        img_path = os.path.join(save_dir, img_filename)
+        image.save(img_path)
 
-        # wandb有効時のみログを送信
-        try:
-            wandb_tracker = accelerator.get_tracker("wandb")
+        # TensorBoard: surface generated samples in the Images panel (main process only).
+        global _sample_tb_log_failure_reported
+        if accelerator.is_main_process:
             try:
-                import wandb
-            except ImportError:  # 事前に一度確認するのでここはエラー出ないはず
-                raise ImportError("No wandb / wandb がインストールされていないようです")
+                tb_writer = None
+                for tracker in getattr(accelerator, "trackers", []):
+                    if getattr(tracker, "name", None) != "tensorboard":
+                        continue
+                    writer = getattr(tracker, "tracker", None)
+                    if writer is not None and hasattr(writer, "add_image"):
+                        tb_writer = writer
+                        break
 
-            wandb_tracker.log({f"sample_{i}": wandb.Image(image)})
-        except:  # wandb 無効時
-            pass
+                if tb_writer is not None:
+                    tb_step = int(steps) if steps is not None else 0
+                    tb_tag = f"sample/{i:02d}"
+                    tb_image = np.asarray(image)
+                    tb_writer.add_image(tb_tag, tb_image, global_step=tb_step, dataformats="HWC")
+                    tb_writer.flush()
+            except Exception as tb_e:
+                if not _sample_tb_log_failure_reported:
+                    _sample_tb_log_failure_reported = True
+                    logger.warning(
+                        f"[sample] failed to write sample image into TensorBoard, fallback to file-only sample: {tb_e}",
+                        exc_info=True,
+                    )
+
     except RuntimeError as e:
         error_text = str(e).lower()
         if "out of memory" in error_text or "cudnn_status_alloc_failed" in error_text:

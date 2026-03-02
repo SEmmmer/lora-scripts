@@ -71,11 +71,6 @@ conv_dim=4   # conv dim | 类似于 network_dim，推荐为 4
 conv_alpha=4 # conv alpha | 类似于 network_alpha，可以采用与 conv_dim 一致或者更小的值
 dropout="0"  # dropout | dropout 概率, 0 为不使用 dropout, 越大则 dropout 越多，推荐 0~0.5， LoHa/LoKr/(IA)^3暂时不支持
 
-# Remote logging | 远程记录设置
-use_wandb=0         # use_wandb | 启用wandb远程记录功能
-wandb_api_key=""    # wandb_api_key | API,通过 https://wandb.ai/authorize 获取
-log_tracker_name="" # log_tracker_name | wandb项目名称,留空则为"network_train"
-
 # ============= DO NOT MODIFY CONTENTS BELOW | 请勿修改下方内容 =====================
 export HF_HOME="huggingface"
 export TF_CPP_MIN_LOG_LEVEL=3
@@ -164,21 +159,14 @@ if [[ $noise_offset != "0" ]]; then extArgs+=("--noise_offset $noise_offset"); f
 
 if [[ $min_snr_gamma -ne 0 ]]; then extArgs+=("--min_snr_gamma $min_snr_gamma"); fi
 
-if [[ $use_wandb == 1 ]]; then
-  extArgs+=("--log_with=all")
-  if [[ $wandb_api_key ]]; then extArgs+=("--wandb_api_key $wandb_api_key"); fi
-  if [[ $log_tracker_name ]]; then extArgs+=("--log_tracker_name $log_tracker_name"); fi
-else
-  extArgs+=("--log_with=tensorboard")
-fi
+extArgs+=("--log_with=tensorboard")
 
 "$PYTHON_BIN" -m accelerate.commands.launch ${launchArgs[@]} --num_cpu_threads_per_process=4 $trainer_file \
   --enable_bucket \
   --pretrained_model_name_or_path=$pretrained_model \
   --train_data_dir=$train_data_dir \
   --output_dir="./output" \
-  --logging_dir="./logs" \
-  --log_prefix=$output_name \
+  --logging_dir="./output" \
   --resolution=$resolution \
   --network_module=$network_module \
   --max_train_epochs=$max_train_epoches \

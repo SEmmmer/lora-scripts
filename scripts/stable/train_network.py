@@ -383,7 +383,9 @@ class NetworkTrainer:
         )
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
-            vae.set_use_memory_efficient_attention_xformers(args.xformers)
+            train_util.try_set_vae_memory_efficient_attention_xformers(
+                vae, args.xformers, args.xformers_vae_fallback
+            )
 
         # 差分追加学習のためにモデルを読み込む
         sys.path.append(os.path.dirname(__file__))
@@ -1088,8 +1090,6 @@ class NetworkTrainer:
 
         if accelerator.is_main_process:
             init_kwargs = {}
-            if args.wandb_run_name:
-                init_kwargs["wandb"] = {"name": args.wandb_run_name}
             if args.log_tracker_config is not None:
                 init_kwargs = toml.load(args.log_tracker_config)
             accelerator.init_trackers(
@@ -1307,7 +1307,7 @@ class NetworkTrainer:
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
                 postfix_logs = dict(logs)
-                train_util.append_gpu_power_to_logs(postfix_logs, gpu_power_averager)
+                train_util.append_gpu_power_to_logs(postfix_logs, gpu_power_averager, compact_for_postfix=True)
                 train_util.append_mesh_net_iops_to_logs(postfix_logs, mesh_net_iops_averager)
                 progress_bar.set_postfix(**postfix_logs)
 
@@ -1318,6 +1318,7 @@ class NetworkTrainer:
                     logs = self.generate_step_logs(
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions, keys_scaled, mean_norm, maximum_norm
                     )
+                    train_util.append_gpu_metrics_to_tensorboard_logs(logs, gpu_power_averager)
                     self.accelerator_logging(accelerator, logs, step_value=global_step)
 
                 if global_step >= args.max_train_steps:
