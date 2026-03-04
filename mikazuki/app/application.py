@@ -369,11 +369,26 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
   if (window.__MIKAZUKI_STAGED_RESOLUTION_PREVIEW__) return;
   window.__MIKAZUKI_STAGED_RESOLUTION_PREVIEW__ = true;
 
-  var PHASES = [
-    { side: 512, ratioKey: "staged_resolution_ratio_512", defaultRatioPercent: 40, sampleScale: 4.0 },
-    { side: 768, ratioKey: "staged_resolution_ratio_768", defaultRatioPercent: 30, sampleScale: 1.78 },
-    { side: 1024, ratioKey: "staged_resolution_ratio_1024", defaultRatioPercent: 30, sampleScale: 1.0 }
-  ];
+  var PROFILE_PRESETS = {
+    "1024": {
+      baseSide: 1024,
+      ruleText: "1024=x, 768=ceil(1.78x), 512=ceil(4x)",
+      phases: [
+        { side: 512, ratioKey: "staged_resolution_ratio_512", defaultRatioPercent: 40, sampleScale: 4.0 },
+        { side: 768, ratioKey: "staged_resolution_ratio_768", defaultRatioPercent: 30, sampleScale: 1.78 },
+        { side: 1024, ratioKey: "staged_resolution_ratio_1024", defaultRatioPercent: 30, sampleScale: 1.0 }
+      ]
+    },
+    "2048": {
+      baseSide: 2048,
+      ruleText: "2048=x, 1536=ceil(1.78x), 1024=ceil(4x)",
+      phases: [
+        { side: 1024, ratioKey: "staged_resolution_ratio_2048_base_1024", defaultRatioPercent: 40, sampleScale: 4.0 },
+        { side: 1536, ratioKey: "staged_resolution_ratio_2048_base_1536", defaultRatioPercent: 30, sampleScale: 1.78 },
+        { side: 2048, ratioKey: "staged_resolution_ratio_2048_base_2048", defaultRatioPercent: 30, sampleScale: 1.0 }
+      ]
+    }
+  };
   var state = {
     notifiedResolutionFix: false,
     trainTypeInput: null,
@@ -434,6 +449,31 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     var x = Math.max(1, toInt(a, 1));
     var y = Math.max(1, toInt(b, 1));
     return Math.abs(x * y) / gcdInt(x, y);
+  }
+
+  function getProfileByBaseSide(baseSide) {
+    return PROFILE_PRESETS[String(toInt(baseSide, 0))] || null;
+  }
+
+  function getSupportedBaseResolutionText() {
+    return Object.keys(PROFILE_PRESETS)
+      .sort(function (a, b) { return toInt(a, 0) - toInt(b, 0); })
+      .map(function (side) { return side + "," + side; })
+      .join(" 或 ");
+  }
+
+  function getAllRatioKeys() {
+    var map = {};
+    Object.keys(PROFILE_PRESETS).forEach(function (baseKey) {
+      var profile = PROFILE_PRESETS[baseKey] || {};
+      var phases = profile.phases || [];
+      for (var i = 0; i < phases.length; i++) {
+        var key = String((phases[i] || {}).ratioKey || "").trim();
+        if (!key) continue;
+        map[key] = true;
+      }
+    });
+    return Object.keys(map);
   }
 
   function getItemSearchText(item, title) {
@@ -624,9 +664,12 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     return [width, height];
   }
 
-  function isBaseResolution1024(rawValue) {
+  function getSupportedBaseSideFromResolution(rawValue) {
     var pair = parseResolution(rawValue);
-    return !!pair && pair[0] === 1024 && pair[1] === 1024;
+    if (!pair) return null;
+    if (pair[0] !== pair[1]) return null;
+    var side = pair[0];
+    return getProfileByBaseSide(side) ? side : null;
   }
 
   function ensurePreviewBlock(anchorItem) {
@@ -660,18 +703,22 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     return block;
   }
 
-  function resolvePhaseRatios() {
+  function resolvePhaseRatios(phases) {
     var ratios = {};
     var total = 0;
     var hasPositive = false;
 
-    for (var i = 0; i < PHASES.length; i++) {
-      var phase = PHASES[i];
+    for (var i = 0; i < phases.length; i++) {
+      var phase = phases[i];
       var ratioField = findSchemaField([
-        new RegExp(phase.ratioKey, "i"),
-        new RegExp(String(phase.side) + ".*占比"),
-        new RegExp("占比.*" + String(phase.side))
+        new RegExp(phase.ratioKey, "i")
       ]);
+      if (!ratioField) {
+        ratioField = findSchemaField([
+          new RegExp(String(phase.side) + ".*占比"),
+          new RegExp("占比.*" + String(phase.side))
+        ]);
+      }
       var value = ratioField ? readFloat(ratioField.item, phase.defaultRatioPercent) : phase.defaultRatioPercent;
       if (!Number.isFinite(value)) {
         return { ok: false, message: phase.ratioKey + " 不是有效数字" };
@@ -694,6 +741,37 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     return { ok: true, ratios: ratios, total: total };
   }
 
+  function findFieldByRatioKey(ratioKey) {
+    if (!ratioKey) return null;
+    return findSchemaField([new RegExp(String(ratioKey), "i")]);
+  }
+
+  function setFieldVisible(field, visible) {
+    if (!field || !field.item) return;
+    var next = visible ? "" : "none";
+    if (field.item.style.display !== next) {
+      field.item.style.display = next;
+    }
+  }
+
+  function applyRatioFieldVisibility(activeProfile) {
+    if (!activeProfile) return;
+    var activeMap = {};
+    var phases = activeProfile.phases || [];
+    for (var i = 0; i < phases.length; i++) {
+      var key = String((phases[i] || {}).ratioKey || "").trim();
+      if (key) activeMap[key] = true;
+    }
+
+    var allKeys = getAllRatioKeys();
+    for (var j = 0; j < allKeys.length; j++) {
+      var ratioKey = allKeys[j];
+      var field = findFieldByRatioKey(ratioKey);
+      if (!field) continue;
+      setFieldVisible(field, !!activeMap[ratioKey]);
+    }
+  }
+
   function buildPhasePreview(
     baseBatchGlobal,
     baseGradAccum,
@@ -701,6 +779,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     saveEveryEpochs,
     baseSampleEveryEpochs,
     useSampleEpochSchedule,
+    phases,
+    baseSide,
+    ruleText,
     phaseRatioPercents,
     totalTrainImages,
     worldSize
@@ -738,8 +819,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     }
 
     var baseBatchPerDevice = Math.floor(baseBatchGlobal / safeWorldSize);
-    for (var i = 0; i < PHASES.length; i++) {
-      var phase = PHASES[i];
+    var basePixels = baseSide * baseSide;
+    for (var i = 0; i < phases.length; i++) {
+      var phase = phases[i];
       var side = phase.side;
       var ratioPercent = toFloat((phaseRatioPercents || {})[side], phase.defaultRatioPercent);
       if (!Number.isFinite(ratioPercent)) ratioPercent = phase.defaultRatioPercent;
@@ -747,7 +829,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       if (ratioPercent > 100) ratioPercent = 100;
 
       var ratio = ratioPercent / 100.0;
-      var phaseBatchGlobal = Math.max(1, Math.floor(baseBatchGlobal * (1024 * 1024) / (side * side)));
+      var phaseBatchGlobal = Math.max(1, Math.floor(baseBatchGlobal * basePixels / (side * side)));
       if (phaseBatchGlobal < safeWorldSize) {
         return {
           ok: false,
@@ -757,7 +839,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
             phaseBatchGlobal +
             ") 小于 world_size(=" +
             safeWorldSize +
-            ")，请调大 1024 基准 batch。"
+            ")，请调大 " +
+            baseSide +
+            " 基准 batch。"
         };
       }
       if (phaseBatchGlobal % safeWorldSize !== 0) {
@@ -769,7 +853,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
             phaseBatchGlobal +
             ") 不能被 world_size(=" +
             safeWorldSize +
-            ") 整除，请调整 1024 基准 batch 或并行规模。"
+            ") 整除，请调整 " +
+            baseSide +
+            " 基准 batch 或并行规模。"
         };
       }
 
@@ -861,6 +947,8 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       totalSteps: canComputeSteps ? totalSteps : null,
       totalTargetSamples: canComputeSteps ? totalTargetSamples : null,
       useSampleEpochSchedule: !!useSampleEpochSchedule,
+      baseSide: baseSide,
+      ruleText: String(ruleText || ""),
       baseGradAccum: baseGradAccum,
       saveEveryEpochs: saveEveryEpochs,
       baseSampleEveryEpochs: baseSampleEveryEpochs,
@@ -906,7 +994,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     }
     html += '<div class="stage-note">Raw 公式: raw_epoch = ceil(base_epoch * phase_ratio * ((phase_batch*phase_grad_accum) / (base_batch*base_grad_accum)))</div>';
     html += '<div class="stage-note">Batch 语义: train_batch_size 按“全局 batch”解释；每卡 batch = 全局 batch / world_size（需整除）</div>';
-    html += '<div class="stage-note">梯度累加规则: x=1 时全阶段保持 1；x>1 时全阶段保持 x（以 1024 基准为准），当前 x=' + preview.baseGradAccum + "</div>";
+    html += '<div class="stage-note">梯度累加规则: x=1 时全阶段保持 1；x>1 时全阶段保持 x（以 ' + preview.baseSide + ' 基准为准），当前 x=' + preview.baseGradAccum + "</div>";
     if (preview.useSampleEpochSchedule) {
       html += '<div class="stage-note">实际公式: actual_epoch = ceil_to_multiple(raw_epoch, lcm(phase_save_every_n_epochs, phase_sample_every_n_epochs))</div>';
     } else {
@@ -915,8 +1003,8 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
     if (preview.hasOversizedBatchPhase) {
       html += '<div class="stage-note">注意：存在 phase_global_batch > 数据集样本数。DataLoader 会重复采样补满 batch，不会留空位。</div>';
     }
-    html += '<div class="stage-note">CKPT 规则: 1024=x, 768=ceil(1.78x), 512=ceil(4x)，x=' + preview.saveEveryEpochs + "（可调占比）</div>";
-    html += '<div class="stage-note">Sample 规则: 1024=x, 768=ceil(1.78x), 512=ceil(4x)，x=' + preview.baseSampleEveryEpochs + "（仅在 enable_preview + sample_every_n_epochs 生效时用于 epoch 取整）</div>";
+    html += '<div class="stage-note">CKPT 规则: ' + preview.ruleText + '，x=' + preview.saveEveryEpochs + "（可调占比）</div>";
+    html += '<div class="stage-note">Sample 规则: ' + preview.ruleText + '，x=' + preview.baseSampleEveryEpochs + "（仅在 enable_preview + sample_every_n_epochs 生效时用于 epoch 取整）</div>";
     html += '<div class="stage-note">Resume 逻辑: runner 会优先按 staged_plan_id 匹配 state，并以 current_global_samples（缺失则回退 current_step）推断续训阶段；若正好命中阶段边界，将自动设置 resume_epoch_offset=1 进入下一阶段。</div>';
     html += "<table><thead><tr><th>阶段</th><th>Raw 验算</th><th>实际验算</th></tr></thead><tbody>";
     for (var j = 0; j < preview.rows.length; j++) {
@@ -1011,18 +1099,28 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       /训练图片分辨率/,
       /训练分辨率/
     ]);
+    var activeProfile = getProfileByBaseSide(1024);
+    if (!activeProfile) return;
     if (resolutionField) {
       var resolutionText = readText(resolutionField.item);
-      if (!isBaseResolution1024(resolutionText)) {
+      var supportedBaseSide = getSupportedBaseSideFromResolution(resolutionText);
+      if (supportedBaseSide == null) {
         var changed = setText(resolutionField.item, "1024,1024");
         if (changed && !state.notifiedResolutionFix) {
           state.notifiedResolutionFix = true;
           setTimeout(function () {
-            window.alert("已启用阶段分辨率训练：该模式固定以 1024,1024 为基础分辨率，已自动调整当前训练分辨率。");
+            window.alert("已启用阶段分辨率训练：当前仅支持基础分辨率 " + getSupportedBaseResolutionText() + "，已自动调整为 1024,1024。");
           }, 0);
         }
+        activeProfile = getProfileByBaseSide(1024);
+      } else {
+        activeProfile = getProfileByBaseSide(supportedBaseSide) || getProfileByBaseSide(1024);
       }
     }
+    var phases = activeProfile.phases || [];
+    var baseSide = toInt(activeProfile.baseSide, 1024);
+    var ruleText = String(activeProfile.ruleText || "");
+    applyRatioFieldVisibility(activeProfile);
 
     var batchField = findSchemaField([
       /train_batch_size/i,
@@ -1091,7 +1189,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
 
     requestTrainImageCount(trainDataDir);
 
-    var ratioState = resolvePhaseRatios();
+    var ratioState = resolvePhaseRatios(phases);
     if (!ratioState.ok) {
       if (statusBlock) {
         updateStatus(statusBlock, "阶段分辨率占比配置错误: " + ratioState.message);
@@ -1115,6 +1213,9 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       saveEveryEpochs,
       baseSampleEveryEpochs,
       useSampleEpochSchedule,
+      phases,
+      baseSide,
+      ruleText,
       ratioState.ratios,
       state.trainImageCount,
       worldSize
@@ -1130,7 +1231,7 @@ _STAGED_RESOLUTION_PREVIEW_INJECTION = """
       if (preview.useSampleEpochSchedule) {
         updateStatus(
           statusBlock,
-          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；world_size=" + worldSize + "；batch 按全局语义校验；ckpt 与 sample 频率按 1024=x, 768=ceil(1.78x), 512=ceil(4x) 并共同参与 epoch 取整。"
+          "阶段分辨率已启用：占比总和 " + ratioState.total.toFixed(4) + "%（<=100%）；world_size=" + worldSize + "；batch 按全局语义校验；ckpt 与 sample 频率按 " + ruleText + " 并共同参与 epoch 取整。"
         );
       } else {
         updateStatus(

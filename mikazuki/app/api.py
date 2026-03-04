@@ -233,7 +233,7 @@ async def create_toml_file(request: Request):
         "sync_use_password_auth": pop_sync_value("sync_use_password_auth", True),
         "sync_ssh_password": pop_sync_value("sync_ssh_password", ""),
         "sync_config_from_main": pop_sync_value("sync_config_from_main", True),
-        "sync_config_keys_from_main": pop_sync_value("sync_config_keys_from_main", "train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,xformers_vae_fallback,staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024"),
+        "sync_config_keys_from_main": pop_sync_value("sync_config_keys_from_main", "train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,xformers_vae_fallback,staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024,staged_resolution_ratio_2048_base_1024,staged_resolution_ratio_2048_base_1536,staged_resolution_ratio_2048_base_2048"),
         "sync_missing_assets_from_main": pop_sync_value("sync_missing_assets_from_main", True),
         "sync_asset_keys": pop_sync_value("sync_asset_keys", "pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume"),
         "sync_main_repo_dir": pop_sync_value("sync_main_repo_dir", os.getcwd()),

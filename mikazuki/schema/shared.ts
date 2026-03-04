@@ -148,12 +148,15 @@
 
         MIXED_RESOLUTION_TRAINING: Schema.object({
             enable_mixed_resolution_training: Schema.boolean().default(false).description(
-                "启用阶段分辨率训练（512 -> 768 -> 1024 三阶段自动切换）。" +
+                "启用阶段分辨率训练（支持 1024 基准: 512 -> 768 -> 1024；2048 基准: 1024 -> 1536 -> 2048）。" +
                 "将按像素量自动换算 batch/epoch/steps，阶段切换时自动清理并重建缓存。"
             ),
-            staged_resolution_ratio_512: Schema.number().min(0).max(100).step(1).default(40).description("512 阶段占比（%），范围 0~100"),
-            staged_resolution_ratio_768: Schema.number().min(0).max(100).step(1).default(30).description("768 阶段占比（%），范围 0~100"),
-            staged_resolution_ratio_1024: Schema.number().min(0).max(100).step(1).default(30).description("1024 阶段占比（%），范围 0~100。三个占比总和不能大于 100"),
+            staged_resolution_ratio_512: Schema.number().min(0).max(100).step(1).default(40).description("1024 基准模式下，512 阶段占比（%），范围 0~100"),
+            staged_resolution_ratio_768: Schema.number().min(0).max(100).step(1).default(30).description("1024 基准模式下，768 阶段占比（%），范围 0~100"),
+            staged_resolution_ratio_1024: Schema.number().min(0).max(100).step(1).default(30).description("1024 基准模式下，1024 阶段占比（%），范围 0~100"),
+            staged_resolution_ratio_2048_base_1024: Schema.number().min(0).max(100).step(1).default(40).description("2048 基准模式下，1024 阶段占比（%），范围 0~100"),
+            staged_resolution_ratio_2048_base_1536: Schema.number().min(0).max(100).step(1).default(30).description("2048 基准模式下，1536 阶段占比（%），范围 0~100"),
+            staged_resolution_ratio_2048_base_2048: Schema.number().min(0).max(100).step(1).default(30).description("2048 基准模式下，2048 阶段占比（%），范围 0~100。三个占比总和不能大于 100"),
         }).description("阶段分辨率训练"),
 
         LR_OPTIMIZER: Schema.intersect([
@@ -275,7 +278,7 @@
             gloo_socket_ifname: createIfnameSchema("enp11s0").description("GLOO 通信网卡名（启动时读取本机网卡并标注速率）"),
             sync_from_main_settings: Schema.object({
                 sync_config_from_main: Schema.boolean().default(true).description("从机启动前从主机同步关键训练参数"),
-                sync_config_keys_from_main: Schema.string().default("train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,xformers_vae_fallback,staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024").description("从主机同步的参数键名，逗号分隔"),
+                sync_config_keys_from_main: Schema.string().default("train_batch_size,gradient_accumulation_steps,max_train_epochs,learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,xformers_vae_fallback,staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024,staged_resolution_ratio_2048_base_1024,staged_resolution_ratio_2048_base_1536,staged_resolution_ratio_2048_base_2048").description("从主机同步的参数键名，逗号分隔"),
                 sync_missing_assets_from_main: Schema.boolean().default(true).description("从机若缺少底模/数据集/resume 等路径时，从主机复制到本地同路径"),
                 sync_asset_keys: Schema.string().default("pretrained_model_name_or_path,train_data_dir,reg_data_dir,vae,resume").description("需要检查并按需同步的路径键名，逗号分隔"),
                 sync_main_repo_dir: Schema.string().default(SYNC_MAIN_REPO_DIR_DEFAULT).description("主机仓库根目录（用于解析相对路径）"),

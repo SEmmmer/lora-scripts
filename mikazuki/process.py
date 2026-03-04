@@ -27,6 +27,13 @@ LEGACY_DEFAULT_SYNC_CONFIG_KEYS = (
     "train_batch_size,gradient_accumulation_steps,max_train_epochs,"
     "learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,"
     "network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,"
+    "staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024,"
+    "staged_resolution_ratio_2048_base_1024,staged_resolution_ratio_2048_base_1536,staged_resolution_ratio_2048_base_2048"
+)
+LEGACY_DEFAULT_SYNC_CONFIG_KEYS_OLD = (
+    "train_batch_size,gradient_accumulation_steps,max_train_epochs,"
+    "learning_rate,unet_lr,text_encoder_lr,resolution,optimizer_type,"
+    "network_dim,network_alpha,save_every_n_epochs,save_model_as,mixed_precision,"
     "staged_resolution_ratio_512,staged_resolution_ratio_768,staged_resolution_ratio_1024"
 )
 DEFAULT_SYNC_CONFIG_KEYS = "*"
@@ -55,21 +62,43 @@ TB_EVENT_FILE_GLOB = "events.out.tfevents.*"
 STATE_REQUIRED_FILES = ("train_state.json", "optimizer.bin", "scheduler.bin")
 STATE_MODEL_FILE_CANDIDATES = ("model.safetensors", "pytorch_model.bin", "model.bin")
 MIXED_RESOLUTION_ENABLE_KEY = "enable_mixed_resolution_training"
-MIXED_RESOLUTION_PHASE_SIDES = (512, 768, 1024)
-MIXED_RESOLUTION_RATIO_CONFIG_KEYS = {
-    512: "staged_resolution_ratio_512",
-    768: "staged_resolution_ratio_768",
-    1024: "staged_resolution_ratio_1024",
-}
-MIXED_RESOLUTION_RATIO_DEFAULTS = {
-    512: 40.0,
-    768: 30.0,
-    1024: 30.0,
-}
-MIXED_RESOLUTION_SAMPLE_EPOCH_FACTORS = {
-    512: 4.0,
-    768: 1.78,
-    1024: 1.0,
+MIXED_RESOLUTION_PROFILES = {
+    1024: {
+        "phase_sides": (512, 768, 1024),
+        "ratio_config_keys": {
+            512: "staged_resolution_ratio_512",
+            768: "staged_resolution_ratio_768",
+            1024: "staged_resolution_ratio_1024",
+        },
+        "ratio_defaults": {
+            512: 40.0,
+            768: 30.0,
+            1024: 30.0,
+        },
+        "sample_epoch_factors": {
+            512: 4.0,
+            768: 1.78,
+            1024: 1.0,
+        },
+    },
+    2048: {
+        "phase_sides": (1024, 1536, 2048),
+        "ratio_config_keys": {
+            1024: "staged_resolution_ratio_2048_base_1024",
+            1536: "staged_resolution_ratio_2048_base_1536",
+            2048: "staged_resolution_ratio_2048_base_2048",
+        },
+        "ratio_defaults": {
+            1024: 40.0,
+            1536: 30.0,
+            2048: 30.0,
+        },
+        "sample_epoch_factors": {
+            1024: 4.0,
+            1536: 1.78,
+            2048: 1.0,
+        },
+    },
 }
 MIXED_RESOLUTION_RESUME_SENTINEL = "__MIXED_AUTO_RESUME__"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
@@ -103,8 +132,12 @@ def _parse_sync_config_keys(value):
     if any(k in {"*", "__all__", "all"} for k in lowered):
         return ["*"]
 
-    legacy = {x.strip().lower() for x in LEGACY_DEFAULT_SYNC_CONFIG_KEYS.split(",")}
-    if {k.strip().lower() for k in keys} == legacy:
+    key_set = {k.strip().lower() for k in keys}
+    legacy_sets = [
+        {x.strip().lower() for x in LEGACY_DEFAULT_SYNC_CONFIG_KEYS.split(",")},
+        {x.strip().lower() for x in LEGACY_DEFAULT_SYNC_CONFIG_KEYS_OLD.split(",")},
+    ]
+    if any(key_set == legacy for legacy in legacy_sets):
         log.info("[sync-config] detected legacy key list, auto-upgrade to full sync mode")
         return ["*"]
 
@@ -144,6 +177,18 @@ def _parse_resolution_pair(value: str) -> Optional[tuple[int, int]]:
     return width, height
 
 
+def _get_mixed_resolution_profile(base_side: int) -> Optional[dict]:
+    profile = MIXED_RESOLUTION_PROFILES.get(int(base_side))
+    if profile is None:
+        return None
+    return {
+        "phase_sides": tuple(profile.get("phase_sides", ()) or ()),
+        "ratio_config_keys": dict(profile.get("ratio_config_keys", {}) or {}),
+        "ratio_defaults": dict(profile.get("ratio_defaults", {}) or {}),
+        "sample_epoch_factors": dict(profile.get("sample_epoch_factors", {}) or {}),
+    }
+
+
 def _ceil_to_multiple(value: int, base: int) -> int:
     if base <= 0:
         return value
@@ -168,13 +213,19 @@ def _scale_epoch_interval(base_value: int, factor: float) -> int:
     return max(1, int(math.ceil(max(1, int(base_value)) * float(factor))))
 
 
-def _load_staged_phase_ratios(config: dict) -> tuple[list[tuple[int, float, float]], str]:
+def _load_staged_phase_ratios(config: dict, profile: dict) -> tuple[list[tuple[int, float, float]], str]:
     configured = []
     ratio_sum = 0.0
 
-    for side in MIXED_RESOLUTION_PHASE_SIDES:
-        key = MIXED_RESOLUTION_RATIO_CONFIG_KEYS[side]
-        default_percent = MIXED_RESOLUTION_RATIO_DEFAULTS[side]
+    phase_sides = tuple(profile.get("phase_sides", ()) or ())
+    ratio_config_keys = dict(profile.get("ratio_config_keys", {}) or {})
+    ratio_defaults = dict(profile.get("ratio_defaults", {}) or {})
+
+    for side in phase_sides:
+        key = ratio_config_keys.get(side)
+        if not key:
+            return [], f"缺少阶段 {side}x{side} 的占比配置键"
+        default_percent = float(ratio_defaults.get(side, 0.0))
         raw_value = config.get(key, default_percent)
         try:
             percent = float(raw_value)
@@ -190,11 +241,10 @@ def _load_staged_phase_ratios(config: dict) -> tuple[list[tuple[int, float, floa
         configured.append((side, percent / 100.0, percent))
 
     if ratio_sum > 100 + 1e-9:
+        ratio_keys = [ratio_config_keys.get(side, f"side_{side}") for side in phase_sides]
         return [], (
             "阶段分辨率占比总和不能大于 100："
-            f"{MIXED_RESOLUTION_RATIO_CONFIG_KEYS[512]} + "
-            f"{MIXED_RESOLUTION_RATIO_CONFIG_KEYS[768]} + "
-            f"{MIXED_RESOLUTION_RATIO_CONFIG_KEYS[1024]} = {ratio_sum:.4f}"
+            f"{' + '.join(ratio_keys)} = {ratio_sum:.4f}"
         )
 
     active = [item for item in configured if item[2] > 0]
@@ -294,11 +344,17 @@ def _build_mixed_resolution_plan(
         return None, f"无法解析训练分辨率: {config.get('resolution')}"
     width, height = resolution
     if width != height:
-        return None, "阶段分辨率训练目前仅支持正方形分辨率（如 1024,1024）"
+        return None, "阶段分辨率训练目前仅支持正方形分辨率（如 1024,1024 或 2048,2048）"
 
     base_side = int(width)
-    if base_side != 1024:
-        return None, "当前阶段分辨率流程固定为 512 -> 768 -> 1024，基础分辨率必须设置为 1024,1024"
+    profile = _get_mixed_resolution_profile(base_side)
+    if profile is None:
+        supported_base_resolutions = ", ".join(f"{side},{side}" for side in sorted(MIXED_RESOLUTION_PROFILES.keys()))
+        return None, f"当前阶段分辨率仅支持以下基础分辨率: {supported_base_resolutions}"
+
+    profile_phase_sides = tuple(profile.get("phase_sides", ()) or ())
+    if not profile_phase_sides:
+        return None, f"阶段分辨率配置缺少 phase_sides: base={base_side}"
     base_pixels = base_side * base_side
 
     try:
@@ -351,7 +407,7 @@ def _build_mixed_resolution_plan(
 
     use_sample_epoch_schedule = bool(sample_prompts and base_sample_every_n_epochs is not None)
 
-    configured_phases, ratio_error = _load_staged_phase_ratios(config)
+    configured_phases, ratio_error = _load_staged_phase_ratios(config, profile)
     if ratio_error:
         return None, ratio_error
     configured_ratio_sum_percent = sum(item[2] for item in configured_phases)
@@ -393,6 +449,7 @@ def _build_mixed_resolution_plan(
     cumulative_epochs = 0
     cumulative_steps = 0
     previous_side = None
+    sample_factors = dict(profile.get("sample_epoch_factors", {}) or {})
 
     for idx, (side, ratio, ratio_percent) in enumerate(configured_phases, start=1):
         target_pixels = side * side
@@ -407,8 +464,8 @@ def _build_mixed_resolution_plan(
                 f"（当前阶段全局 batch={global_batch_this_phase}）",
             )
 
-        sample_factor = float(MIXED_RESOLUTION_SAMPLE_EPOCH_FACTORS.get(side, base_pixels / target_pixels))
-        # Keep gradient-accumulation semantics anchored to 1024 baseline:
+        sample_factor = float(sample_factors.get(side, base_pixels / target_pixels))
+        # Keep gradient-accumulation semantics anchored to base resolution:
         # - base grad_accum <= 1: keep 1
         # - base grad_accum > 1: keep the same x across all phases
         gradient_accumulation_steps_this_phase = (
@@ -529,8 +586,12 @@ def _build_mixed_resolution_plan(
         "preview_enabled": bool(preview_enabled),
         "use_sample_epoch_schedule": bool(use_sample_epoch_schedule),
         "base_sample_every_n_epochs": int(base_sample_every_n_epochs) if base_sample_every_n_epochs is not None else None,
-        "sample_every_n_epochs_rule": "1024=x, 768=ceil(1.78x), 512=ceil(4x)",
-        "save_every_n_epochs_rule": "1024=x, 768=ceil(1.78x), 512=ceil(4x)",
+        "sample_every_n_epochs_rule": ", ".join(
+            [f"{side}=ceil({sample_factors.get(side, base_pixels / (side * side)):g}x)" for side in sorted(profile_phase_sides, reverse=True)]
+        ).replace(f"{base_side}=ceil(1x)", f"{base_side}=x"),
+        "save_every_n_epochs_rule": ", ".join(
+            [f"{side}=ceil({sample_factors.get(side, base_pixels / (side * side)):g}x)" for side in sorted(profile_phase_sides, reverse=True)]
+        ).replace(f"{base_side}=ceil(1x)", f"{base_side}=x"),
         "base_resolution": f"{base_side},{base_side}",
         "base_batch_size": int(base_global_batch),
         "base_batch_size_global": int(base_global_batch),
@@ -544,7 +605,7 @@ def _build_mixed_resolution_plan(
         "global_epoch_train_images_with_repeats": int(global_epoch_train_images),
         "total_mixed_epochs": int(cumulative_epochs),
         "total_mixed_steps": int(cumulative_steps),
-        "gradient_accumulation_steps_rule": "x=1 -> all phases keep 1; x>1 -> all phases keep x (anchored to 1024 baseline)",
+        "gradient_accumulation_steps_rule": f"x=1 -> all phases keep 1; x>1 -> all phases keep x (anchored to {base_side} baseline)",
         "phases": phase_configs,
     }
     return plan, ""
