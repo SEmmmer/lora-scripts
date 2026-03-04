@@ -1360,6 +1360,103 @@ _UI_SETTINGS_ABOUT_CLEANUP_INJECTION = f"""
 </script>
 """
 
+_IFRAME_DARK_TRANSITION_GUARD_INJECTION = """
+<style id="mikazuki-iframe-dark-transition-guard-style">
+html.dark .iframe-container.mikazuki-iframe-dark-guard {
+  position: relative;
+  background: var(--c-bg-soft);
+}
+html.dark .iframe-container.mikazuki-iframe-dark-guard::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--c-bg-soft);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease;
+  z-index: 5;
+}
+html.dark .iframe-container.mikazuki-iframe-dark-guard[data-mikazuki-iframe-loading="1"]::before {
+  opacity: 1;
+}
+html.dark .iframe-container.mikazuki-iframe-dark-guard iframe.iframe-main {
+  transition: opacity 0.16s ease;
+}
+html.dark .iframe-container.mikazuki-iframe-dark-guard[data-mikazuki-iframe-loading="1"] iframe.iframe-main {
+  opacity: 0.01;
+}
+</style>
+<script id="mikazuki-iframe-dark-transition-guard">
+(function () {
+  if (window.__MIKAZUKI_IFRAME_DARK_TRANSITION_GUARD__) return;
+  window.__MIKAZUKI_IFRAME_DARK_TRANSITION_GUARD__ = true;
+
+  var TARGET_PATH_RE = /(?:^|\\/)(tensorboard|tageditor)(?:\\.(?:html|md))?\\/?$/i;
+
+  function isTargetPage() {
+    var path = (window.location && window.location.pathname) ? String(window.location.pathname) : "";
+    return TARGET_PATH_RE.test(path);
+  }
+
+  function getIframeContainer() {
+    return document.querySelector(".iframe-container");
+  }
+
+  function setLoading(container, loading) {
+    if (!container) return;
+    container.setAttribute("data-mikazuki-iframe-loading", loading ? "1" : "0");
+  }
+
+  function bindContainer(container) {
+    if (!container || container.__mikazukiIframeDarkGuardBound) return;
+    container.__mikazukiIframeDarkGuardBound = true;
+    container.classList.add("mikazuki-iframe-dark-guard");
+    setLoading(container, true);
+
+    var iframe = container.querySelector("iframe.iframe-main") || container.querySelector("iframe");
+    if (!iframe) {
+      setLoading(container, false);
+      return;
+    }
+
+    function clearLoadingSoon(delay) {
+      setTimeout(function () { setLoading(container, false); }, delay);
+    }
+
+    iframe.addEventListener("load", function () {
+      clearLoadingSoon(20);
+    });
+
+    var srcObserver = new MutationObserver(function (mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i] && mutations[i].type === "attributes" && mutations[i].attributeName === "src") {
+          setLoading(container, true);
+          clearLoadingSoon(1800);
+          return;
+        }
+      }
+    });
+    srcObserver.observe(iframe, { attributes: true, attributeFilter: ["src"] });
+
+    clearLoadingSoon(3200);
+    setTimeout(function () { setLoading(container, false); }, 9000);
+  }
+
+  function bootstrap() {
+    if (!isTargetPage()) return;
+    var container = getIframeContainer();
+    if (!container) return;
+    bindContainer(container);
+  }
+
+  var observer = new MutationObserver(function () { bootstrap(); });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  window.addEventListener("load", bootstrap);
+  setTimeout(bootstrap, 0);
+})();
+</script>
+"""
+
 _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
 <script id="mikazuki-tensorboard-runs-default">
 (function () {
@@ -1371,6 +1468,9 @@ _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
   var NOISE_LABEL_RE = /(smoothing|ignore outliers|download|tooltip|x-axis|relative|filter|regex|paging|status|sort|direction|ascending|descending|settings|dark mode|light mode|select all|deselect all)/i;
   var DATE_RE = /(20\\d{2})[-_/](\\d{2})[-_/](\\d{2})(?:[ T_:-]?(\\d{2})[:_-]?(\\d{2})[:_-]?(\\d{2}))?/;
   var SUFFIX_RE = /_(\\d{1,6})(?!.*_\\d)/;
+  var TB_THEME_STORAGE_KEY = "_tb_global_settings";
+  var THEME_DARK_RE = /^dark$/i;
+  var THEME_LIGHT_RE = /^light$/i;
 
   function isTensorboardWrapperPath() {
     var path = (window.location && window.location.pathname) ? String(window.location.pathname) : "";
@@ -1386,6 +1486,84 @@ _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
       if (/tensorboard|6006|\\/proxy\\/tensorboard/i.test(src)) return f;
     }
     return iframes.length === 1 ? iframes[0] : null;
+  }
+
+  function toTensorboardProxySrc(rawSrc) {
+    var src = String(rawSrc || "").trim();
+    if (!src) return "/proxy/tensorboard/";
+    if (/^\\/proxy\\/tensorboard(?:\\/|$)/i.test(src)) {
+      return src === "/proxy/tensorboard" ? "/proxy/tensorboard/" : src;
+    }
+
+    try {
+      var u = new URL(src, window.location.href);
+      var path = String(u.pathname || "/");
+      if (/^\\/proxy\\/tensorboard(?:\\/|$)/i.test(path)) {
+        var passthrough = path === "/proxy/tensorboard" ? "/proxy/tensorboard/" : path;
+        if (u.search) passthrough += u.search;
+        if (u.hash) passthrough += u.hash;
+        return passthrough;
+      }
+      var cleanPath = path.replace(/^\\/+/, "");
+      var proxied = "/proxy/tensorboard/" + cleanPath;
+      if (cleanPath === "") proxied = "/proxy/tensorboard/";
+      if (u.search) proxied += u.search;
+      if (u.hash) proxied += u.hash;
+      return proxied;
+    } catch (_e) {
+      return "/proxy/tensorboard/";
+    }
+  }
+
+  function ensureTensorboardIframeProxy(iframe) {
+    if (!iframe) return false;
+    var attrSrc = String(iframe.getAttribute("src") || "").trim();
+    var propSrc = "";
+    try {
+      propSrc = String(iframe.src || "").trim();
+    } catch (_e) {}
+    var current = attrSrc || propSrc;
+    var next = toTensorboardProxySrc(current);
+    if (current === next) return false;
+    iframe.setAttribute("src", next);
+    return true;
+  }
+
+  function forceTensorboardIframeProxyReload(iframe) {
+    if (!iframe) return false;
+    var now = Date.now();
+    var lastTs = Number(iframe.__mikazukiTensorboardProxyReloadTs || 0);
+    if (Number.isFinite(lastTs) && now - lastTs < 1200) return false;
+
+    var attrSrc = String(iframe.getAttribute("src") || "").trim();
+    var propSrc = "";
+    try {
+      propSrc = String(iframe.src || "").trim();
+    } catch (_e) {}
+    var base = toTensorboardProxySrc(attrSrc || propSrc);
+
+    var hash = "";
+    var hashIdx = base.indexOf("#");
+    if (hashIdx >= 0) {
+      hash = base.slice(hashIdx);
+      base = base.slice(0, hashIdx);
+    }
+    var sep = base.indexOf("?") >= 0 ? "&" : "?";
+    var forced = base + sep + "__mikazuki_proxy_reload=" + String(now) + hash;
+    iframe.__mikazukiTensorboardProxyReloadTs = now;
+    iframe.setAttribute("src", forced);
+    return true;
+  }
+
+  function getMainThemeToggleButton() {
+    var buttons = document.querySelectorAll("button.toggle-color-mode-button");
+    if (!buttons || buttons.length === 0) return null;
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      var title = normalizeLabel(btn.getAttribute("title") || "");
+      if (/toggle color mode/i.test(title)) return btn;
+    }
+    return null;
   }
 
   function parseRunOrderScore(label) {
@@ -1412,6 +1590,192 @@ _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
 
   function normalizeLabel(text) {
     return String(text || "").replace(/\\s+/g, " ").trim();
+  }
+
+  function isMainPageDarkMode() {
+    var userMode = "";
+    try {
+      userMode = String(window.localStorage.getItem("vuepress-color-scheme") || "").toLowerCase();
+    } catch (_e) {}
+    if (userMode === "dark") return true;
+    if (userMode === "light") return false;
+
+    if (document.documentElement && document.documentElement.classList.contains("dark")) {
+      return true;
+    }
+    return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  }
+
+  function setTensorboardThemeStorage(win, desiredDark) {
+    if (!win) return;
+    var mode = desiredDark ? "dark" : "light";
+    try {
+      var storage = win.localStorage;
+      if (!storage) return;
+      var raw = String(storage.getItem(TB_THEME_STORAGE_KEY) || "{}");
+      var data = {};
+      try {
+        data = JSON.parse(raw) || {};
+      } catch (_parseErr) {
+        data = {};
+      }
+      if (data.theme === mode) return;
+      data.theme = mode;
+      storage.setItem(TB_THEME_STORAGE_KEY, JSON.stringify(data));
+    } catch (_e) {}
+  }
+
+  function findTensorboardThemeToggleButton(doc) {
+    if (!doc) return null;
+    var selectors = [
+      "button[aria-label]",
+      "button[title]",
+      "app-header-dark-mode-toggle button",
+    ];
+    for (var i = 0; i < selectors.length; i++) {
+      var nodes = doc.querySelectorAll(selectors[i]);
+      for (var j = 0; j < nodes.length; j++) {
+        var el = nodes[j];
+        var aria = normalizeLabel(el.getAttribute("aria-label") || "");
+        var title = normalizeLabel(el.getAttribute("title") || "");
+        if (
+          /light or dark theme/i.test(aria) ||
+          /current mode/i.test(title) ||
+          /dark mode|light mode|browser default/i.test(title)
+        ) {
+          return el;
+        }
+      }
+    }
+    return null;
+  }
+
+  function getTensorboardCurrentThemeMode(doc, button) {
+    var title = "";
+    if (button) {
+      title = normalizeLabel(button.getAttribute("title") || button.title || "");
+      if (/\\[\\s*dark mode\\s*\\]/i.test(title)) return "dark";
+      if (/\\[\\s*light mode\\s*\\]/i.test(title)) return "light";
+      if (/\\[\\s*browser default\\s*\\]/i.test(title)) return "browser_default";
+    }
+
+    if (doc && doc.body && doc.body.classList.contains("dark-mode")) {
+      return "dark";
+    }
+    return "light";
+  }
+
+  function clickTensorboardThemeMenuItem(doc, desiredDark) {
+    if (!doc) return false;
+    var targetRe = desiredDark ? THEME_DARK_RE : THEME_LIGHT_RE;
+    var buttons = doc.querySelectorAll(
+      "button[mat-menu-item], .mat-mdc-menu-panel button, .cdk-overlay-container button, button[role='menuitem']"
+    );
+    for (var i = 0; i < buttons.length; i++) {
+      var b = buttons[i];
+      var label = normalizeLabel(b.textContent || b.innerText || "");
+      if (!targetRe.test(label)) continue;
+      if (typeof b.click === "function") {
+        b.click();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function syncTensorboardTheme(iframe) {
+    var win = null;
+    var doc = null;
+    try {
+      win = iframe.contentWindow || null;
+      doc = iframe.contentDocument || (win ? win.document : null);
+    } catch (_e) {
+      if (!ensureTensorboardIframeProxy(iframe)) {
+        forceTensorboardIframeProxyReload(iframe);
+      }
+      return false;
+    }
+    if (!doc || !doc.documentElement) return false;
+
+    var desiredDark = isMainPageDarkMode();
+    var desiredMode = desiredDark ? "dark" : "light";
+    setTensorboardThemeStorage(win, desiredDark);
+
+    if (doc.body) {
+      doc.body.classList.toggle("dark-mode", desiredDark);
+    }
+
+    var button = findTensorboardThemeToggleButton(doc);
+    var currentMode = getTensorboardCurrentThemeMode(doc, button);
+    if (currentMode === desiredMode) return true;
+
+    if (!button || !win) return false;
+    if (win.__MIKAZUKI_TENSORBOARD_THEME_SYNC_PENDING__) return false;
+
+    win.__MIKAZUKI_TENSORBOARD_THEME_SYNC_PENDING__ = true;
+    try {
+      if (typeof button.click === "function") button.click();
+    } catch (_e) {}
+
+    setTimeout(function () {
+      var clicked = clickTensorboardThemeMenuItem(doc, desiredDark);
+      if (!clicked) {
+        try {
+          if (typeof button.click === "function") button.click();
+        } catch (_e) {}
+        setTimeout(function () {
+          clickTensorboardThemeMenuItem(doc, desiredDark);
+        }, 120);
+      }
+      setTimeout(function () {
+        win.__MIKAZUKI_TENSORBOARD_THEME_SYNC_PENDING__ = false;
+      }, 220);
+    }, 70);
+
+    return false;
+  }
+
+  function triggerTensorboardThemeSync() {
+    if (!isTensorboardWrapperPath()) return;
+    var iframe = getTensorboardIframe();
+    if (!iframe) return;
+    var proxied = ensureTensorboardIframeProxy(iframe);
+    bindTensorboardIframe(iframe);
+    if (proxied) {
+      setTimeout(function () { syncTensorboardTheme(iframe); }, 260);
+      setTimeout(function () { syncTensorboardTheme(iframe); }, 900);
+      return;
+    }
+    syncTensorboardTheme(iframe);
+    setTimeout(function () { syncTensorboardTheme(iframe); }, 160);
+    setTimeout(function () { syncTensorboardTheme(iframe); }, 460);
+  }
+
+  function bindMainThemeTrigger() {
+    var btn = getMainThemeToggleButton();
+    if (!btn || btn.__mikazukiTensorboardThemeTriggerBound) return;
+    btn.__mikazukiTensorboardThemeTriggerBound = true;
+    btn.addEventListener("click", function () {
+      // Theme class/localStorage updates happen asynchronously in VuePress.
+      setTimeout(triggerTensorboardThemeSync, 0);
+      setTimeout(triggerTensorboardThemeSync, 140);
+      setTimeout(triggerTensorboardThemeSync, 420);
+    }, true);
+  }
+
+  function bindRootThemeClassTrigger() {
+    var root = document.documentElement;
+    if (!root || root.__mikazukiTensorboardThemeClassObserverBound) return;
+    root.__mikazukiTensorboardThemeClassObserverBound = true;
+    var obs = new MutationObserver(function (mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i] && mutations[i].type === "attributes" && mutations[i].attributeName === "class") {
+          triggerTensorboardThemeSync();
+          return;
+        }
+      }
+    });
+    obs.observe(root, { attributes: true, attributeFilter: ["class"] });
   }
 
   function getRunCandidates(doc) {
@@ -1547,40 +1911,68 @@ _TENSORBOARD_RUNS_DEFAULT_INJECTION = """
 
     var tries = 0;
     var maxTries = 180;
-    var timer = null;
+    var runTimer = null;
 
-    function tryApply() {
+    function tryApplyRuns() {
       tries += 1;
       var done = applyToIframeDocument(iframe);
       if (done || tries >= maxTries) {
-        if (timer) {
-          clearInterval(timer);
-          timer = null;
+        if (runTimer) {
+          clearInterval(runTimer);
+          runTimer = null;
         }
       }
     }
 
+    function trySyncThemeNow() {
+      syncTensorboardTheme(iframe);
+    }
+
+    var srcObserver = new MutationObserver(function (mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i] && mutations[i].type === "attributes" && mutations[i].attributeName === "src") {
+          var changed = ensureTensorboardIframeProxy(iframe);
+          if (changed) {
+            setTimeout(trySyncThemeNow, 260);
+            return;
+          }
+          setTimeout(trySyncThemeNow, 120);
+          return;
+        }
+      }
+    });
+    srcObserver.observe(iframe, { attributes: true, attributeFilter: ["src"] });
+
     iframe.addEventListener("load", function () {
+      ensureTensorboardIframeProxy(iframe);
       tries = 0;
-      setTimeout(tryApply, 250);
-      setTimeout(tryApply, 1200);
+      setTimeout(tryApplyRuns, 250);
+      setTimeout(tryApplyRuns, 1200);
+      setTimeout(trySyncThemeNow, 320);
+      setTimeout(trySyncThemeNow, 1100);
     });
 
-    timer = setInterval(tryApply, 800);
-    setTimeout(tryApply, 300);
+    runTimer = setInterval(tryApplyRuns, 800);
+    setTimeout(tryApplyRuns, 300);
+    setTimeout(trySyncThemeNow, 380);
   }
 
   function bootstrap() {
     if (!isTensorboardWrapperPath()) return;
+    bindMainThemeTrigger();
+    bindRootThemeClassTrigger();
     var iframe = getTensorboardIframe();
-    if (iframe) bindTensorboardIframe(iframe);
+    if (iframe) {
+      ensureTensorboardIframeProxy(iframe);
+      bindTensorboardIframe(iframe);
+      syncTensorboardTheme(iframe);
+    }
   }
 
   var observer = new MutationObserver(function () { bootstrap(); });
   observer.observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener("load", bootstrap);
   setTimeout(bootstrap, 0);
-  setInterval(bootstrap, 1500);
 })();
 </script>
 """
@@ -1717,6 +2109,20 @@ def _inject_ui_settings_about_cleanup(html_content: str) -> str:
     return _UI_SETTINGS_ABOUT_CLEANUP_INJECTION + "\n" + html_content
 
 
+def _inject_iframe_dark_transition_guard(html_content: str) -> str:
+    if 'id="mikazuki-iframe-dark-transition-guard"' in html_content:
+        return html_content
+
+    module_tag = '<script type="module"'
+    if module_tag in html_content:
+        return html_content.replace(module_tag, _IFRAME_DARK_TRANSITION_GUARD_INJECTION + "\n" + module_tag, 1)
+
+    if "</head>" in html_content:
+        return html_content.replace("</head>", _IFRAME_DARK_TRANSITION_GUARD_INJECTION + "\n</head>", 1)
+
+    return _IFRAME_DARK_TRANSITION_GUARD_INJECTION + "\n" + html_content
+
+
 def _inject_tensorboard_runs_default(html_content: str) -> str:
     if 'id="mikazuki-tensorboard-runs-default"' in html_content:
         return html_content
@@ -1794,6 +2200,7 @@ def _get_patched_frontend_html_content(request_path: str) -> str | None:
     content = _inject_schema_bootstrap(content)
     content = _inject_hide_deprecated_lora_docs(content)
     content = _inject_ui_settings_about_cleanup(content)
+    content = _inject_iframe_dark_transition_guard(content)
     content = _inject_tensorboard_runs_default(content)
     content = _inject_ctrl_s_save_config(content)
     content = _inject_worker_mode_guard(content)
